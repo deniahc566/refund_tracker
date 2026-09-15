@@ -1,0 +1,19 @@
+# LiteX Refund Tracker theme — derived from the LiteX Portal design system.
+# See DESIGN_SYSTEM.md for the full palette and rationale.
+[theme]
+base = "light"
+
+# Brand azure used by the portal for buttons, active tabs, checkboxes, links.
+primaryColor = "#0D87E1"
+
+# Page backdrop: light neutral (portal body is #F2F1F7; we use a slightly cooler
+# near-white). Cards/inputs sit on white via secondaryBackgroundColor.
+backgroundColor = "#F5F6FA"
+secondaryBackgroundColor = "#FFFFFF"
+
+# Text tokens.
+textColor = "#212121"
+
+# Outfit is loaded via CSS @import in refund_tracker/ui.inject_theme().
+# Keep a valid built-in fallback here so the theme is valid on Streamlit 1.57.
+font = "sans serif"

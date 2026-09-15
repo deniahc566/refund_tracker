@@ -10,6 +10,7 @@ Run:  .\.venv\Scripts\streamlit.exe run Refund_Tracker\app.py
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -26,15 +27,16 @@ try:
 except Exception:
     pass
 
-from refund_tracker import config
+from refund_tracker.batch import FileResult, aggregate, process_one_file
 from refund_tracker.db import Store
-from refund_tracker.parser import parse_statement, file_hash
 from refund_tracker.refund_file import (
     build_refund_rows, write_refund_file, default_batch_id,
 )
 from refund_tracker.results import parse_result_file
+from refund_tracker.ui import header, inject_theme
 
-st.set_page_config(page_title="LiteX Refund Tracker", page_icon="💸", layout="wide")
+st.set_page_config(page_title="LiteX Hoàn phí", page_icon="💸", layout="wide")
+inject_theme()
 
 
 @st.cache_resource
@@ -44,130 +46,257 @@ def get_store() -> Store:
 
 store = get_store()
 
-st.title("💸 LiteX Refund Tracker")
-st.caption(f"Data store: **{store.label}**")
+header("Theo dõi hoàn phí")
 
-tab_up, tab_queue, tab_import, tab_dash = st.tabs(
-    ["1 · Upload statement", "2 · Refund queue", "3 · Import results", "4 · Dashboard"]
+# --- Tổng quan: hiển thị giữa header và các tab ----------------------------
+_s = store.stats()
+d1, d2, d3, d4 = st.columns(4)
+d1.metric("Tổng giao dịch", f"{_s['total_transactions']:,}")
+d2.metric("Giao dịch trùng", f"{_s['duplicates']:,}")
+d3.metric("Chờ hoàn", f"{_s['pending_refunds']:,}")
+d4.metric("Đã hoàn (VND)", f"{_s['refunded_amount']:,.0f}")
+st.divider()
+
+tab_up, tab_queue, tab_import, tab_history = st.tabs(
+    ["1 · Tải sao kê", "2 · Hàng chờ hoàn", "3 · Nhập kết quả", "4 · Lịch sử hoàn phí"]
 )
 
 
-def _save_tmp(uploaded) -> str:
-    suffix = Path(uploaded.name).suffix or ".xlsx"
+def _save_bytes(name: str, data: bytes) -> str:
+    """Write uploaded bytes to a temp file and return its path."""
+    suffix = Path(name).suffix or ".xlsx"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(uploaded.getbuffer())
+    tmp.write(data)
     tmp.close()
     return tmp.name
 
 
 # --- 1. Upload statement ---------------------------------------------------
 with tab_up:
-    st.subheader("Upload sao kê ngân hàng (BIDV)")
-    up = st.file_uploader("Statement .xlsx", type=["xlsx"], key="stmt")
-    if up is not None:
-        path = _save_tmp(up)
-        with st.spinner("Parsing…"):
-            txns, summary = parse_statement(path)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Numbered rows", summary["total_numbered_rows"])
-        c2.metric("Insurance premium rows", summary["insurance_rows"])
-        c3.metric("Non-insurance credits skipped", summary["non_insurance_credit_rows"])
-        if summary["unmatched_samples"]:
-            with st.expander("Skipped credit rows (not insurance premiums)"):
-                st.write(summary["unmatched_samples"])
+    st.subheader("Tải sao kê ngân hàng (BIDV)")
+    # A rotating key lets us clear the uploader after processing: bumping it
+    # remounts the widget empty, so files don't retain between batches.
+    ups = st.file_uploader(
+        "File sao kê .xlsx (một hoặc nhiều)",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key=f"stmt_{st.session_state.get('stmt_key', 0)}",
+    )
+    ups = ups or []
+    n_files = len(ups)
+    if n_files:
+        st.caption(f"Đã chọn {n_files} file.")
 
-        if txns:
-            st.dataframe(
-                pd.DataFrame([t.as_dict() for t in txns[:50]])[
-                    ["ref_no", "trans_date", "cif", "product", "ky", "order_id",
-                     "corr_account", "corr_name", "credit"]
-                ],
-                use_container_width=True,
-            )
-            st.caption(f"Showing first 50 of {len(txns)} parsed rows.")
+    if st.button(f"Xử lý {n_files} file", type="primary", disabled=(n_files == 0)):
+        # Deterministic order (sorted by filename) for predictable UX. Duplicate
+        # detection itself is order-independent (recomputed by trans_ts in the DB).
+        files = sorted(ups, key=lambda f: f.name)
+        results: list[FileResult] = []
+        progress = st.progress(0.0, text=f"Bắt đầu… (0/{n_files})")
+        for i, uploaded in enumerate(files, start=1):
+            with st.status(
+                f"Đang xử lý {uploaded.name} ({i}/{n_files})…", expanded=False
+            ) as status_box:
+                try:
+                    tmp_path = _save_bytes(uploaded.name, uploaded.getvalue())
+                    res = process_one_file(store, tmp_path, uploaded.name)
+                except Exception as exc:  # noqa: BLE001 — never abort the batch
+                    res = FileResult(
+                        filename=uploaded.name,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                results.append(res)
+                status_box.update(
+                    label=(
+                        f"✓ {uploaded.name} — {res.new_rows} mới, "
+                        f"{res.new_duplicates} trùng, "
+                        f"{res.skipped_existing} đã có"
+                    ) if res.ok else f"✗ {uploaded.name} — {res.error}",
+                    state="complete" if res.ok else "error",
+                )
+            progress.progress(i / n_files, text=f"Đã xử lý {i}/{n_files} file")
+        progress.empty()
+        # Persist the summary, then clear the uploader (fresh key) and rerun so
+        # the file list empties while the results below stay visible.
+        st.session_state["stmt_results"] = [r.as_row() for r in results]
+        st.session_state["stmt_agg"] = aggregate(results)
+        st.session_state["stmt_key"] = st.session_state.get("stmt_key", 0) + 1
+        st.rerun()
 
-        if st.button("Ingest into ledger", type="primary", disabled=not txns):
-            report = store.ingest(txns, up.name, summary, file_hash(path))
-            st.success(
-                f"Ingested. New rows: {report['new_rows']} · "
-                f"Already present (skipped): {report['skipped_existing']} · "
-                f"**New duplicates flagged: {report['new_duplicates']}**"
+    # -- Results from the last batch (persist after the uploader is cleared) -
+    agg = st.session_state.get("stmt_agg")
+    if agg:
+        st.markdown("#### Tổng kết")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Số file xử lý", agg["files_processed"])
+        c2.metric("File lỗi", agg["files_failed"])
+        c3.metric("Tổng dòng mới", agg["total_new_rows"])
+        c4.metric("Trùng mới", agg["total_new_duplicates"])
+        st.markdown("#### Kết quả từng file")
+        st.dataframe(
+            pd.DataFrame(st.session_state.get("stmt_results", [])),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if agg["files_failed"]:
+            st.warning(
+                f"{agg['files_failed']} file bị lỗi — xem cột **Lỗi** ở trên. "
+                f"Các file còn lại vẫn được xử lý."
             )
-            if report["new_duplicates"]:
-                st.info("Go to the **Refund queue** tab to generate the refund file.")
+        if agg["total_new_duplicates"]:
+            st.info(
+                f"**Phát hiện {agg['total_new_duplicates']} giao dịch trùng mới.** "
+                f"Sang tab **Hàng chờ hoàn** để tải file hoàn phí."
+            )
+        elif agg["files_processed"]:
+            st.success("Đã xử lý xong. Không có giao dịch trùng mới.")
 
 
 # --- 2. Refund queue -------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def _build_refund_bytes(payload: str) -> bytes:
+    """Build the bulk-payment file bytes. Cached by content (`payload` = the
+    refund rows as JSON) so the 186 KB template isn't re-loaded on every rerun
+    — only when the pending set actually changes."""
+    refund_rows = json.loads(payload)
+    out = str(Path(tempfile.gettempdir()) / f"refund_{default_batch_id()}.xlsx")
+    write_refund_file(refund_rows, out)
+    with open(out, "rb") as f:
+        return f.read()
+
+
 with tab_queue:
-    st.subheader("Pending refunds (duplicate charges)")
+    st.subheader("Các khoản chờ hoàn (giao dịch trùng)")
     pending = store.pending_duplicates()
-    st.write(f"**{len(pending)}** duplicate transaction(s) awaiting refund.")
+    st.write(f"**{len(pending)}** khoản đang chờ hoàn (chưa hoàn thành).")
+
     if pending:
         refund_rows = build_refund_rows(pending)
+        # Make sure each pending duplicate has a refund row so the result-import
+        # step can match it later. Idempotent — only creates missing rows.
+        store.ensure_pending_refunds(refund_rows)
+
         df = pd.DataFrame(refund_rows)
-        st.dataframe(
-            df[["ref_no", "cif", "product", "beneficiary_account",
-                "beneficiary_name", "beneficiary_bank", "amount",
-                "payment_detail", "needs_review"]],
-            use_container_width=True,
-        )
+        view = df[["ref_no", "cif", "product", "beneficiary_account",
+                   "beneficiary_name", "beneficiary_bank", "amount", "currency",
+                   "payment_detail", "needs_review"]].rename(columns={
+            "ref_no": "Mã tham chiếu", "cif": "CIF", "product": "Sản phẩm",
+            "beneficiary_account": "TK hưởng", "beneficiary_name": "Tên hưởng",
+            "beneficiary_bank": "Ngân hàng", "amount": "Số tiền",
+            "currency": "Loại tiền", "payment_detail": "Nội dung",
+            "needs_review": "Cần kiểm tra",
+        })
+        st.dataframe(view, use_container_width=True)
         if df["needs_review"].any():
             st.warning(
-                "Some rows use a product with no configured bank/amount rule "
-                "(needs_review = True). They fall back to the statement values — "
-                "verify before sending."
+                "Một số dòng thuộc sản phẩm chưa cấu hình ngân hàng/số tiền "
+                "(Cần kiểm tra = True) — đang lấy tạm giá trị từ sao kê. Hãy "
+                "kiểm tra trước khi gửi."
             )
 
-        if st.button("Generate refund file", type="primary"):
-            batch_id = default_batch_id()
-            out = str(Path(tempfile.gettempdir()) / f"refund_{batch_id}.xlsx")
-            write_refund_file(refund_rows, out)
-            store.record_refund_batch(refund_rows, batch_id)
-            with open(out, "rb") as f:
-                st.download_button(
-                    f"⬇ Download {Path(out).name}", f.read(),
-                    file_name=f"form_dien_case_hoan_{batch_id}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-            st.success(
-                f"Batch {batch_id} recorded ({len(refund_rows)} refunds set to "
-                f"'pending'). These won't reappear in the queue."
-            )
-            st.rerun()
+        # Always-available download: the file is rebuilt from the current queue
+        # on every render, so it can be downloaded at any time.
+        st.download_button(
+            f"⬇ Tải file hoàn phí ({len(refund_rows)} dòng)",
+            _build_refund_bytes(json.dumps(refund_rows, sort_keys=True, default=str)),
+            file_name=f"bulk_payment_{default_batch_id()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            key="refund_dl",
+        )
+        st.caption(
+            "Các khoản vẫn nằm đây cho đến khi được đánh dấu Hoàn thành ở tab "
+            "**Nhập kết quả**. Khoản thất bại vẫn ở lại hàng chờ. Tải file bất cứ lúc nào."
+        )
     else:
-        st.info("Nothing pending. Upload a statement that repeats a prior charge.")
+        st.info("Không có khoản nào chờ hoàn. Hãy tải sao kê có giao dịch bị thu trùng.")
 
 
 # --- 3. Import results -----------------------------------------------------
 with tab_import:
-    st.subheader("Import completed refund file")
+    st.subheader("Nhập file kết quả đã thực hiện")
     st.caption(
-        "Re-upload the generated file with the **Status** (Done/Failed) and "
-        "**Reason** columns filled in. Matched back by the Ref column."
+        "Tải lại **chính file bulk-payment đã được ngân hàng thực hiện**. "
+        "Mọi dòng trong file = **đã hoàn thành**, khớp 1:1 theo Ref nằm cuối "
+        "cột **Nội dung** (… - <ref>). Không cần cột trạng thái. "
+        "(Tùy chọn: thêm cột **Status** ở cột **P** ghi 'Failed' để đánh dấu dòng lỗi.)"
     )
-    res_up = st.file_uploader("Completed refund .xlsx", type=["xlsx"], key="result")
+    res_up = st.file_uploader(
+        "File hoàn phí đã thực hiện (.xlsx)",
+        type=["xlsx"],
+        key=f"result_{st.session_state.get('result_key', 0)}",
+    )
     if res_up is not None:
-        path = _save_tmp(res_up)
-        results = parse_result_file(path)
-        st.write(f"Parsed **{len(results)}** result row(s).")
-        st.dataframe(pd.DataFrame(results), use_container_width=True)
-        if st.button("Apply results", type="primary", disabled=not results):
-            outcome = store.apply_results(results)
-            st.success(
-                f"Done: {outcome['done']} · Failed (returned to queue): "
-                f"{outcome['failed']} · Unknown ref: {outcome['unknown_ref']} · "
-                f"Unrecognized status: {outcome['other']}"
-            )
+        results = parse_result_file(_save_bytes(res_up.name, res_up.getvalue()))
+        st.caption(f"**{res_up.name}** — đọc được {len(results)} dòng kết quả.")
+        st.dataframe(
+            pd.DataFrame(results).rename(columns={
+                "ref_no": "Mã tham chiếu", "beneficiary_account": "TK hưởng",
+                "payment_detail": "Nội dung", "status": "Trạng thái", "reason": "Lý do",
+            }),
+            use_container_width=True,
+        )
+        if st.button("Cập nhật kết quả", type="primary", disabled=not results):
+            st.session_state["result_outcome"] = store.apply_results(results)
+            # Clear the uploader (fresh key) so the file doesn't retain.
+            st.session_state["result_key"] = st.session_state.get("result_key", 0) + 1
             st.rerun()
 
+    # Outcome persists after the uploaded file is cleared.
+    oc = st.session_state.get("result_outcome")
+    if oc:
+        st.success(
+            f"Hoàn thành: {oc['done']} · Thất bại (trả về hàng chờ): "
+            f"{oc['failed']} · Không khớp: {oc['unknown_ref']} · "
+            f"Nhập nhằng (khớp >1 theo TK+nội dung): {oc['ambiguous']} · "
+            f"Trạng thái không nhận diện: {oc['other']}"
+        )
 
-# --- 4. Dashboard ----------------------------------------------------------
-with tab_dash:
-    st.subheader("Ledger overview")
-    s = store.stats()
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total transactions", s["total_transactions"])
-    c2.metric("Duplicates detected", s["duplicates"])
-    c3.metric("Pending refunds", s["pending_refunds"])
-    c4.metric("Refunded (VND)", f"{s['refunded_amount']:,.0f}")
-    st.write("**Refunds by status:**", s["refunds_by_status"] or "—")
+
+# --- 4. Lịch sử hoàn phí ---------------------------------------------------
+_STATUS_LABELS = {"Hoàn thành": "done", "Thất bại": "failed", "Chờ": "pending"}
+
+with tab_history:
+    st.subheader("Lịch sử hoàn phí")
+    st.caption("Tra cứu theo OrderID, STK, ngày thu phí, ngày hoàn. Kết quả kèm "
+               "cả giao dịch gốc bị thu trùng.")
+
+    c1, c2 = st.columns(2)
+    f_order = c1.text_input("OrderID", key="h_order")
+    f_stk = c2.text_input("STK (tài khoản hưởng)", key="h_stk")
+    c3, c4 = st.columns(2)
+    charge_rng = c3.date_input("Ngày thu phí (từ – đến)", value=(),
+                               format="DD/MM/YYYY", key="h_charge")
+    refund_rng = c4.date_input("Ngày hoàn (từ – đến)", value=(),
+                               format="DD/MM/YYYY", key="h_refund")
+    picked_status = st.multiselect("Trạng thái", list(_STATUS_LABELS.keys()),
+                                   key="h_status")
+
+    def _range(v):
+        """A st.date_input range -> (from, to); tolerant of 0/1/2 picks."""
+        if isinstance(v, (list, tuple)):
+            if len(v) == 2:
+                return v[0], v[1]
+            if len(v) == 1:
+                return v[0], v[0]
+        return None, None
+
+    cf, ct = _range(charge_rng)
+    rf, rt = _range(refund_rng)
+    hist = store.refund_history(
+        order_id=f_order.strip() or None,
+        account=f_stk.strip() or None,
+        charge_from=cf, charge_to=ct,
+        refund_from=rf, refund_to=rt,
+        statuses=[_STATUS_LABELS[s] for s in picked_status] or None,
+    )
+    st.write(f"**{len(hist)}** kết quả.")
+    st.dataframe(hist, use_container_width=True, hide_index=True)
+    if len(hist):
+        st.download_button(
+            "⬇ Tải CSV",
+            hist.to_csv(index=False).encode("utf-8-sig"),
+            file_name="lich_su_hoan_phi.csv",
+            mime="text/csv",
+            key="hist_csv",
+        )

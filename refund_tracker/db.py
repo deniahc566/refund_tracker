@@ -12,10 +12,23 @@ Two-level identity:
 from __future__ import annotations
 
 import datetime as _dt
+import functools
+import threading
 from typing import Iterable
 
 import duckdb
 import pandas as pd
+
+
+def _synchronized(method):
+    """Serialize DB access: one DuckDB/MotherDuck connection is shared across
+    Streamlit's rerun threads, and DuckDB connections don't allow concurrent
+    use. A reentrant lock makes overlapping tab reruns safe."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 from . import config
 from .parser import Txn
@@ -84,6 +97,7 @@ class Store:
         self.conn_str, self.label = config.get_db_target()
         if conn_str:
             self.conn_str = conn_str
+        self._lock = threading.RLock()
         self.con = duckdb.connect(self.conn_str)
         self.con.execute(_SCHEMA)
 
@@ -91,6 +105,7 @@ class Store:
         self.con.close()
 
     # -- ingestion ----------------------------------------------------------
+    @_synchronized
     def ingest(self, txns: Iterable[Txn], source_file: str, summary: dict,
                file_hash: str) -> dict:
         """Insert new transactions (idempotent on ref_no), then recompute
@@ -122,7 +137,10 @@ class Store:
         after = self.con.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
         new_rows = after - before
 
-        self._recompute_duplicates()
+        # Only recompute when something was actually inserted, and only for the
+        # dedup_keys touched by this batch — not the whole (large) ledger.
+        if new_rows:
+            self._recompute_duplicates(ingested_at=now)
 
         new_dups = self.con.execute(
             "SELECT COUNT(*) FROM transactions "
@@ -142,12 +160,31 @@ class Store:
             "label": self.label,
         }
 
-    def _recompute_duplicates(self) -> None:
-        """First-seen-wins across the whole ledger. rn=1 is legitimate."""
+    @_synchronized
+    def _recompute_duplicates(self, ingested_at=None) -> None:
+        """First-seen-wins ranking. rn=1 is legitimate, the rest are duplicates.
+
+        With `ingested_at`, only the dedup_keys touched by that batch are
+        re-ranked (correct because first-seen-wins is per-key), which keeps the
+        cost proportional to the new file rather than the whole ledger. Without
+        it, the entire table is recomputed.
+        """
+        if ingested_at is None:
+            scope = "SELECT ref_no, dedup_key, trans_ts, seq_no FROM transactions"
+            params: list = []
+        else:
+            scope = (
+                "SELECT ref_no, dedup_key, trans_ts, seq_no FROM transactions "
+                "WHERE dedup_key IN ("
+                "  SELECT DISTINCT dedup_key FROM transactions WHERE ingested_at = ?"
+                ")"
+            )
+            params = [ingested_at]
         self.con.execute(
-            """
-            WITH ranked AS (
-                SELECT ref_no, dedup_key,
+            f"""
+            WITH scope AS ({scope}),
+            ranked AS (
+                SELECT ref_no,
                        ROW_NUMBER() OVER (
                            PARTITION BY dedup_key
                            ORDER BY trans_ts, TRY_CAST(seq_no AS BIGINT), ref_no
@@ -156,22 +193,25 @@ class Store:
                            PARTITION BY dedup_key
                            ORDER BY trans_ts, TRY_CAST(seq_no AS BIGINT), ref_no
                        ) AS first_ref
-                FROM transactions
+                FROM scope
             )
             UPDATE transactions t
             SET is_duplicate = (r.rn > 1),
                 dup_of_ref   = CASE WHEN r.rn > 1 THEN r.first_ref ELSE NULL END
             FROM ranked r
             WHERE t.ref_no = r.ref_no
-            """
+            """,
+            params,
         )
 
     # -- refund queue -------------------------------------------------------
+    @_synchronized
     def pending_duplicates(self):
-        """Duplicate transactions not yet resolved (no refund row, or failed).
-
-        A 'done' or 'pending' refund keeps its txn out of the queue so the
-        1:1 mapping holds and refunds never regenerate.
+        """Every duplicate transaction still awaiting a refund — i.e. anything
+        NOT yet marked 'done'. Covers not-yet-generated duplicates, generated
+        'pending' ones, and 'failed' ones. Only a 'done' refund leaves the
+        queue, so the tab always lists what still owes a refund and the file
+        can be regenerated/downloaded at any time.
         """
         return self.con.execute(
             """
@@ -181,93 +221,193 @@ class Store:
             FROM transactions t
             LEFT JOIN refunds r ON r.ref_no = t.ref_no
             WHERE t.is_duplicate
-              AND (r.ref_no IS NULL OR r.status = 'failed')
+              AND (r.ref_no IS NULL OR r.status <> 'done')
             ORDER BY t.trans_ts, t.ref_no
             """
         ).fetchall()
 
-    def record_refund_batch(self, refund_rows: list[dict], batch_id: str) -> None:
-        """Upsert refund rows as 'pending' for a generated batch. Re-batching a
-        previously failed refund resets it to pending under the new batch."""
+    @_synchronized
+    def ensure_pending_refunds(self, refund_rows: list[dict]) -> int:
+        """Create a refund row (status 'pending') for any pending duplicate that
+        doesn't have one yet, so the result-import step can match it by ref_no.
+        Idempotent: existing rows (pending/failed/done) are left untouched.
+        Returns how many new rows were created. Single bulk INSERT (anti-join)
+        instead of one round-trip per row."""
+        if not refund_rows:
+            return 0
         now = _dt.datetime.now()
-        for r in refund_rows:
-            self.con.execute(
-                """
-                INSERT INTO refunds
-                    (ref_no, dedup_key, cif, product, beneficiary_account,
-                     beneficiary_name, beneficiary_bank, amount, payment_detail,
-                     needs_review, status, reason, batch_id, generated_at, resolved_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?, 'pending', NULL, ?, ?, NULL)
-                ON CONFLICT (ref_no) DO UPDATE SET
-                    status='pending', reason=NULL, batch_id=excluded.batch_id,
-                    generated_at=excluded.generated_at, resolved_at=NULL,
-                    beneficiary_account=excluded.beneficiary_account,
-                    beneficiary_name=excluded.beneficiary_name,
-                    beneficiary_bank=excluded.beneficiary_bank,
-                    amount=excluded.amount, payment_detail=excluded.payment_detail,
-                    needs_review=excluded.needs_review
-                """,
-                [r["ref_no"], r["dedup_key"], r["cif"], r["product"],
-                 r["beneficiary_account"], r["beneficiary_name"],
-                 r["beneficiary_bank"], r["amount"], r["payment_detail"],
-                 r["needs_review"], batch_id, now],
-            )
+        cols = ["ref_no", "dedup_key", "cif", "product", "beneficiary_account",
+                "beneficiary_name", "beneficiary_bank", "amount", "payment_detail",
+                "needs_review"]
+        df = pd.DataFrame([{c: r[c] for c in cols} for r in refund_rows]
+                          ).drop_duplicates(subset="ref_no", keep="first")
+        df["status"] = "pending"
+        df["reason"] = None
+        df["batch_id"] = "AUTO"
+        df["generated_at"] = now
+        df["resolved_at"] = None
+        allcols = cols + ["status", "reason", "batch_id", "generated_at", "resolved_at"]
+        before = self.con.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
+        self.con.register("ref_stage", df)
+        self.con.execute(
+            f"INSERT INTO refunds ({', '.join(allcols)}) "
+            f"SELECT {', '.join(allcols)} FROM ref_stage s "
+            f"WHERE NOT EXISTS (SELECT 1 FROM refunds r WHERE r.ref_no = s.ref_no)"
+        )
+        self.con.unregister("ref_stage")
+        after = self.con.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
+        return after - before
 
+    @_synchronized
     def apply_results(self, results: list[dict]) -> dict:
-        """Update refund status/reason from an imported result file, matched by
-        ref_no. Returns counts by outcome."""
+        """Update refund status/reason from an imported result file. Matched by
+        ref_no (column L) for an exact 1:1 link, falling back to beneficiary
+        account + remark when the ref is missing. Returns counts by outcome;
+        `ambiguous` counts fallback rows that match more than one refund."""
         now = _dt.datetime.now()
-        updated = {"done": 0, "failed": 0, "unknown_ref": 0, "other": 0}
+        updated = {"done": 0, "failed": 0, "unknown_ref": 0, "ambiguous": 0, "other": 0}
+        done_words = ("done", "success", "thanh cong", "hoan thanh", "ok", "thành công")
+        fail_words = ("failed", "fail", "that bai", "loi", "error", "thất bại")
+
+        ref_rows: list[dict] = []       # matched exactly by ref_no (bulk path)
+        fallback: list[dict] = []       # no ref -> account+remark (rare, loop)
         for res in results:
-            ref = res.get("ref_no", "").strip()
+            ref_no = (res.get("ref_no") or "").strip()
+            account = (res.get("beneficiary_account") or "").strip()
+            remark = (res.get("payment_detail") or "").strip()
             status = (res.get("status") or "").strip().lower()
             reason = res.get("reason") or None
-            if not ref:
+            if not ref_no and not account and not remark:
                 updated["unknown_ref"] += 1
                 continue
-            exists = self.con.execute(
-                "SELECT 1 FROM refunds WHERE ref_no = ?", [ref]
-            ).fetchone()
-            if not exists:
-                updated["unknown_ref"] += 1
-                continue
-            norm_status = (
-                "done" if status in ("done", "success", "thanh cong", "hoan thanh", "ok")
-                else "failed" if status in ("failed", "fail", "that bai", "loi", "error")
-                else None
-            )
-            if norm_status is None:
+            # No status column present in the executed file => Done. An optional
+            # Status column can still flag specific rows Failed.
+            norm = ("done" if not status or status in done_words
+                    else "failed" if status in fail_words else None)
+            if norm is None:
                 updated["other"] += 1
                 continue
+            if ref_no:
+                ref_rows.append({"ref_no": ref_no, "status": norm, "reason": reason})
+            else:
+                fallback.append({"account": account, "remark": remark,
+                                 "status": norm, "reason": reason})
+
+        # -- Bulk path: one UPDATE via join, regardless of row count ---------
+        if ref_rows:
+            df = pd.DataFrame(ref_rows).drop_duplicates(subset="ref_no", keep="last")
+            self.con.register("res_stage", df)
+            counts = dict(self.con.execute(
+                "SELECT s.status, COUNT(*) FROM res_stage s "
+                "JOIN refunds r ON r.ref_no = s.ref_no GROUP BY s.status"
+            ).fetchall())
+            updated["done"] += int(counts.get("done", 0))
+            updated["failed"] += int(counts.get("failed", 0))
+            updated["unknown_ref"] += len(df) - sum(int(v) for v in counts.values())
+            self.con.execute(
+                "UPDATE refunds r SET status = s.status, reason = s.reason, "
+                "resolved_at = CASE WHEN s.status = 'done' THEN ? ELSE NULL END "
+                "FROM res_stage s WHERE r.ref_no = s.ref_no",
+                [now],
+            )
+            self.con.unregister("res_stage")
+
+        # -- Fallback path: account + remark (usually empty) -----------------
+        for fb in fallback:
+            matches = self.con.execute(
+                "SELECT ref_no FROM refunds "
+                "WHERE beneficiary_account = ? AND payment_detail = ? "
+                "ORDER BY (status = 'done') ASC, ref_no",
+                [fb["account"], fb["remark"]],
+            ).fetchall()
+            if not matches:
+                updated["unknown_ref"] += 1
+                continue
+            if len(matches) > 1:
+                updated["ambiguous"] += 1
             self.con.execute(
                 "UPDATE refunds SET status=?, reason=?, resolved_at=? WHERE ref_no=?",
-                [norm_status, reason, now if norm_status == "done" else None, ref],
+                [fb["status"], fb["reason"],
+                 now if fb["status"] == "done" else None, matches[0][0]],
             )
-            updated[norm_status] += 1
+            updated[fb["status"]] += 1
         return updated
 
+    # -- history / lookup ---------------------------------------------------
+    @_synchronized
+    def refund_history(self, order_id=None, account=None, charge_from=None,
+                       charge_to=None, refund_from=None, refund_to=None,
+                       statuses=None):
+        """Searchable refund history. Each row is a refunded/duplicate charge
+        joined to its original ("giao dịch gốc" via dup_of_ref). Filters:
+        order_id / account (contains), charge-date range (on the duplicate's
+        trans date), refund-date range (resolved_at), and status list.
+        Returns a pandas DataFrame with Vietnamese column headers."""
+        where, params = ["1=1"], []
+        if order_id:
+            where.append("t.order_id ILIKE ?"); params.append(f"%{order_id}%")
+        if account:
+            where.append("t.corr_account ILIKE ?"); params.append(f"%{account}%")
+        if charge_from:
+            where.append("substr(t.trans_ts, 1, 10) >= ?"); params.append(str(charge_from))
+        if charge_to:
+            where.append("substr(t.trans_ts, 1, 10) <= ?"); params.append(str(charge_to))
+        if refund_from:
+            where.append("CAST(r.resolved_at AS DATE) >= ?"); params.append(str(refund_from))
+        if refund_to:
+            where.append("CAST(r.resolved_at AS DATE) <= ?"); params.append(str(refund_to))
+        if statuses:
+            where.append("r.status IN (" + ",".join(["?"] * len(statuses)) + ")")
+            params.extend(statuses)
+        sql = f"""
+            SELECT
+                t.order_id                       AS "OrderID",
+                t.cif                            AS "CIF",
+                t.product                        AS "Sản phẩm",
+                t.ky                             AS "Kỳ",
+                t.corr_account                   AS "STK hưởng",
+                t.corr_name                      AS "Tên hưởng",
+                r.amount                         AS "Số tiền",
+                t.trans_date                     AS "Ngày thu phí",
+                strftime(r.resolved_at, '%d/%m/%Y %H:%M:%S') AS "Ngày hoàn",
+                r.status                         AS "Trạng thái",
+                r.reason                         AS "Lý do",
+                t.ref_no                         AS "Mã GD (trùng)",
+                t.dup_of_ref                     AS "Mã GD gốc",
+                o.trans_date                     AS "Ngày thu phí (GD gốc)"
+            FROM refunds r
+            JOIN transactions t ON t.ref_no = r.ref_no
+            LEFT JOIN transactions o ON o.ref_no = t.dup_of_ref
+            WHERE {' AND '.join(where)}
+            ORDER BY r.resolved_at DESC NULLS LAST, t.trans_ts DESC
+        """
+        return self.con.execute(sql, params).df()
+
     # -- stats --------------------------------------------------------------
+    @_synchronized
     def stats(self) -> dict:
-        q = self.con.execute
-        total = q("SELECT COUNT(*) FROM transactions").fetchone()[0]
-        dups = q("SELECT COUNT(*) FROM transactions WHERE is_duplicate").fetchone()[0]
+        # All scalar counts in one round-trip (stats runs on every rerun; on
+        # MotherDuck each separate query is a network hop).
+        total, dups, pending, refunded_amt = self.con.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM transactions),
+                (SELECT COUNT(*) FROM transactions WHERE is_duplicate),
+                (SELECT COUNT(*) FROM transactions t
+                 LEFT JOIN refunds r ON r.ref_no = t.ref_no
+                 WHERE t.is_duplicate AND (r.ref_no IS NULL OR r.status <> 'done')),
+                (SELECT COALESCE(SUM(amount), 0) FROM refunds WHERE status = 'done')
+            """
+        ).fetchone()
         by_status = dict(
-            q("SELECT status, COUNT(*) FROM refunds GROUP BY status").fetchall()
+            self.con.execute(
+                "SELECT status, COUNT(*) FROM refunds GROUP BY status"
+            ).fetchall()
         )
-        pending_q = q(
-            """
-            SELECT COUNT(*) FROM transactions t
-            LEFT JOIN refunds r ON r.ref_no = t.ref_no
-            WHERE t.is_duplicate AND (r.ref_no IS NULL OR r.status='failed')
-            """
-        ).fetchone()[0]
-        refunded_amt = q(
-            "SELECT COALESCE(SUM(amount),0) FROM refunds WHERE status='done'"
-        ).fetchone()[0]
         return {
             "total_transactions": total,
             "duplicates": dups,
-            "pending_refunds": pending_q,
+            "pending_refunds": pending,
             "refunds_by_status": by_status,
             "refunded_amount": refunded_amt,
         }

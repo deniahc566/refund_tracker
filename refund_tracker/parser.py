@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
-import openpyxl
+from python_calamine import CalamineWorkbook
 
 from . import config
 from .config import COL, norm
@@ -104,17 +104,27 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
     (c) match the insurance description pattern are returned as Txn records.
     `summary` reports counts for the upload screen.
     """
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    ws = wb[config.STMT_SHEET] if config.STMT_SHEET in wb.sheetnames else wb.active
+    # Read with python-calamine (Rust) — ~10x faster than openpyxl. It returns
+    # ragged rows (trailing empties trimmed), so pad each row to a fixed width.
+    wb = CalamineWorkbook.from_path(path)
+    names = wb.sheet_names
+    sheet = config.STMT_SHEET if config.STMT_SHEET in names else names[0]
+    raw_rows = wb.get_sheet_by_name(sheet).to_python(skip_empty_area=False)
+    width = max(COL.values()) + 1
 
     total_rows = 0
     unmatched: list[str] = []
     txns: list[Txn] = []
     seen_refs: set[str] = set()
 
-    for row in ws.iter_rows(values_only=True):
-        stt = row[COL["stt"]] if len(row) > COL["stt"] else None
-        if not (stt is not None and str(stt).strip().isdigit()):
+    for row in raw_rows:
+        if len(row) < width:
+            row = list(row) + [None] * (width - len(row))
+        stt = row[COL["stt"]]
+        s = str(stt).strip()
+        if s.endswith(".0"):  # tolerate numeric STT like 2.0
+            s = s[:-2]
+        if not s.isdigit():
             continue
         total_rows += 1
 
@@ -140,7 +150,7 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
         txns.append(
             Txn(
                 ref_no=ref_no,
-                stt=str(stt).strip(),
+                stt=s,
                 trans_date=str(row[COL["trans_date"]] or "").strip(),
                 trans_ts=_parse_ts(row[COL["trans_date"]]),
                 eff_date=str(row[COL["eff_date"]] or "").strip(),
@@ -162,7 +172,6 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
                 dedup_key=make_dedup_key(order_id, ky, cif, product),
             )
         )
-    wb.close()
 
     summary = {
         "total_numbered_rows": total_rows,
