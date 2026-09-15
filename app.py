@@ -88,7 +88,7 @@ def _save_bytes(name: str, data: bytes) -> str:
 
 # --- 1. Upload statement ---------------------------------------------------
 with tab_up:
-    st.subheader("Tải sao kê ngân hàng (BIDV)")
+    st.subheader("Tải sao kê ngân hàng")
     # A rotating key lets us clear the uploader after processing: bumping it
     # remounts the widget empty, so files don't retain between batches.
     ups = st.file_uploader(
@@ -181,7 +181,7 @@ def _build_refund_bytes(payload: str) -> bytes:
 
 
 with tab_queue:
-    st.subheader("Các khoản chờ hoàn (giao dịch trùng)")
+    st.subheader("Các khoản chờ hoàn")
     pending = store.pending_duplicates()
     st.write(f"**{len(pending)}** khoản đang chờ hoàn (chưa hoàn thành).")
 
@@ -230,12 +230,6 @@ with tab_queue:
 # --- 3. Import results -----------------------------------------------------
 with tab_import:
     st.subheader("Nhập file kết quả đã thực hiện")
-    st.caption(
-        "Tải lại **chính file bulk-payment đã được ngân hàng thực hiện**. "
-        "Mọi dòng trong file = **đã hoàn thành**, khớp 1:1 theo Ref nằm cuối "
-        "cột **Nội dung** (… - <ref>). Không cần cột trạng thái. "
-        "(Tùy chọn: thêm cột **Status** ở cột **P** ghi 'Failed' để đánh dấu dòng lỗi.)"
-    )
     res_up = st.file_uploader(
         "File hoàn phí đã thực hiện (.xlsx)",
         type=["xlsx"],
@@ -273,9 +267,6 @@ _STATUS_LABELS = {"Hoàn thành": "done", "Thất bại": "failed", "Chờ": "pe
 
 with tab_history:
     st.subheader("Lịch sử hoàn phí")
-    st.caption("Tra cứu theo OrderID, STK, ngày thu phí, ngày hoàn. Kết quả kèm "
-               "cả giao dịch gốc bị thu trùng.")
-
     c1, c2 = st.columns(2)
     f_order = c1.text_input("OrderID", key="h_order")
     f_stk = c2.text_input("STK (tài khoản hưởng)", key="h_stk")

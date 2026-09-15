@@ -35,6 +35,10 @@ SHADOW_SOFT = "0 6px 16px rgba(0,0,0,0.08)"
 SHADOW_BTN_HOVER = "0 8px 20px 0 #0C83DF66"
 
 FONT_STACK = "'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+# Headings use a system stack (no Outfit): Outfit's Vietnamese diacritics render
+# poorly at bold heading weights, so titles get a font with full VN coverage
+# (Segoe UI on Windows), matching how body/label text renders.
+HEAD_FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif"
 
 # Status tokens
 ERROR = "#F32B2B"
@@ -66,7 +70,7 @@ html, body, [class*="css"], .stApp,
 /* Headings */
 h1, h2, h3, h4,
 [data-testid="stHeading"] {{
-    font-family: {FONT_STACK} !important;
+    font-family: {HEAD_FONT} !important;
     color: {TEXT};
     font-weight: 600;
     letter-spacing: -0.2px;
@@ -106,7 +110,7 @@ h1, h2, h3, h4,
     gap: 2px;
 }}
 .litex-title {{
-    font-family: {FONT_STACK};
+    font-family: {HEAD_FONT};
     font-weight: 600;
     font-size: 20px;
     color: {TEXT};
