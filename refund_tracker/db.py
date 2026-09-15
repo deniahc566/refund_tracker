@@ -333,6 +333,27 @@ class Store:
             updated[fb["status"]] += 1
         return updated
 
+    # -- heatmap ------------------------------------------------------------
+    @_synchronized
+    def data_years(self) -> list[int]:
+        """Years present in the ledger (by transaction date), newest first."""
+        rows = self.con.execute(
+            "SELECT DISTINCT substr(trans_ts, 1, 4) AS y FROM transactions "
+            "WHERE trans_ts <> '' AND trans_ts IS NOT NULL ORDER BY y DESC"
+        ).fetchall()
+        return [int(r[0]) for r in rows if r[0] and str(r[0]).isdigit()]
+
+    @_synchronized
+    def daily_counts(self, year: int) -> dict:
+        """{'YYYY-MM-DD': (txn_count, dup_count)} for the given year."""
+        rows = self.con.execute(
+            "SELECT substr(trans_ts, 1, 10) AS d, COUNT(*), "
+            "COUNT(*) FILTER (WHERE is_duplicate) "
+            "FROM transactions WHERE substr(trans_ts, 1, 4) = ? GROUP BY 1",
+            [str(year)],
+        ).fetchall()
+        return {r[0]: (int(r[1]), int(r[2])) for r in rows if r[0]}
+
     # -- history / lookup ---------------------------------------------------
     @_synchronized
     def refund_history(self, order_id=None, account=None, charge_from=None,

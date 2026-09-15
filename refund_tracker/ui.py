@@ -13,6 +13,10 @@ Public API:
 """
 from __future__ import annotations
 
+import calendar as _cal
+from datetime import date, timedelta
+from html import escape
+
 import streamlit as st
 
 # --- Design tokens (mirrors DESIGN_SYSTEM.md) ------------------------------
@@ -347,3 +351,81 @@ def header(title: str = "Refund Tracker") -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+# --- Contribution-style heatmap (GitHub look) ------------------------------
+# Empty day is neutral gray; the 4 filled levels ramp light -> dark. Blue for
+# transactions (LiteX brand), red for duplicates (warning).
+_HEAT_BLUE = ["#ebedf0", "#cfe9fb", "#86c8f0", "#2f9be0", "#0d6fb8"]
+_HEAT_RED = ["#ebedf0", "#fde0e0", "#f5a3a3", "#ef5f5f", "#d61f1f"]
+_WEEKDAY_LABELS = {1: "T2", 3: "T4", 5: "T6"}  # Mon / Wed / Fri rows (Sun-first)
+_MONTHS_VN = ["", "Th1", "Th2", "Th3", "Th4", "Th5", "Th6",
+              "Th7", "Th8", "Th9", "Th10", "Th11", "Th12"]
+
+
+def heatmap_html(daily: dict, year: int, metric: str = "txn") -> str:
+    """GitHub-style year heatmap. `daily` maps 'YYYY-MM-DD' -> (txns, dups);
+    `metric` is 'txn' or 'dup' (chooses the colored value). The tooltip always
+    shows both counts. Weeks are columns (Sunday-first), weekdays are rows."""
+    start, end = date(year, 1, 1), date(year, 12, 31)
+    first_sunday = start - timedelta(days=(start.weekday() + 1) % 7)
+    ramp = _HEAT_RED if metric == "dup" else _HEAT_BLUE
+
+    max_v = 0
+    for t, dp in daily.values():
+        max_v = max(max_v, dp if metric == "dup" else t)
+
+    def level(v: int) -> int:
+        if v <= 0 or max_v <= 0:
+            return 0
+        r = v / max_v
+        return 1 if r <= 0.25 else 2 if r <= 0.5 else 3 if r <= 0.75 else 4
+
+    squares, month_labels = [], []
+    seen_months = set()
+    d = start
+    while d <= end:
+        col = (d - first_sunday).days // 7
+        row = (d.weekday() + 1) % 7  # Sun=0 .. Sat=6
+        t, dp = daily.get(d.isoformat(), (0, 0))
+        v = dp if metric == "dup" else t
+        color = ramp[level(v)]
+        title = escape(f"{d.strftime('%d/%m/%Y')}: {t:,} giao dịch · {dp:,} trùng")
+        squares.append(
+            f'<div title="{title}" style="grid-row:{row + 1};grid-column:{col + 1};'
+            f'width:12px;height:12px;border-radius:3px;background:{color}"></div>'
+        )
+        if d.month not in seen_months:  # month label at the week its 1st lands
+            seen_months.add(d.month)
+            month_labels.append(
+                f'<div style="grid-column:{col + 1};grid-row:1;font-size:10px;'
+                f'color:{MUTED}">{_MONTHS_VN[d.month]}</div>'
+            )
+        d += timedelta(days=1)
+    n_cols = (end - first_sunday).days // 7 + 1
+
+    wk_labels = "".join(
+        f'<div style="grid-row:{r + 1};grid-column:1;font-size:10px;color:{MUTED};'
+        f'line-height:12px">{lbl}</div>'
+        for r, lbl in _WEEKDAY_LABELS.items()
+    )
+    legend = "".join(
+        f'<span style="width:12px;height:12px;border-radius:3px;background:{c};'
+        f'display:inline-block"></span>' for c in ramp
+    )
+    return f"""
+    <div style="overflow-x:auto;padding:4px 0">
+      <div style="display:grid;grid-template-columns:repeat({n_cols},12px);
+                  gap:3px;margin-bottom:2px;margin-left:22px">{''.join(month_labels)}</div>
+      <div style="display:flex;gap:4px;align-items:start">
+        <div style="display:grid;grid-template-rows:repeat(7,12px);gap:3px;width:18px">{wk_labels}</div>
+        <div style="display:grid;grid-template-rows:repeat(7,12px);
+                    grid-template-columns:repeat({n_cols},12px);gap:3px;
+                    grid-auto-flow:column">{''.join(squares)}</div>
+      </div>
+      <div style="display:flex;gap:4px;align-items:center;justify-content:flex-end;
+                  margin-top:6px;font-size:11px;color:{MUTED}">
+        Ít {legend} Nhiều
+      </div>
+    </div>
+    """

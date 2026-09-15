@@ -33,7 +33,7 @@ from refund_tracker.refund_file import (
     build_refund_rows, write_refund_file, default_batch_id,
 )
 from refund_tracker.results import parse_result_file
-from refund_tracker.ui import header, inject_theme
+from refund_tracker.ui import header, heatmap_html, inject_theme
 
 st.set_page_config(page_title="LiteX Hoàn phí", page_icon="💸", layout="wide")
 inject_theme()
@@ -55,6 +55,21 @@ d1.metric("Tổng giao dịch", f"{_s['total_transactions']:,}")
 d2.metric("Giao dịch trùng", f"{_s['duplicates']:,}")
 d3.metric("Chờ hoàn", f"{_s['pending_refunds']:,}")
 d4.metric("Đã hoàn (VND)", f"{_s['refunded_amount']:,.0f}")
+
+# --- Heatmap theo ngày (kiểu GitHub) ---------------------------------------
+_years = store.data_years() or [pd.Timestamp.now().year]
+hm1, hm2 = st.columns([2, 1])
+_metric_label = hm1.radio(
+    "Số lượng giao dịch theo ngày",
+    ["Số giao dịch thu phí", "Số giao dịch trùng"],
+    horizontal=True, key="hm_metric",
+)
+_year = hm2.selectbox("Năm", _years, key="hm_year")
+_metric = "dup" if _metric_label == "Số giao dịch trùng" else "txn"
+st.markdown(
+    heatmap_html(store.daily_counts(int(_year)), int(_year), _metric),
+    unsafe_allow_html=True,
+)
 st.divider()
 
 tab_up, tab_queue, tab_import, tab_history = st.tabs(
