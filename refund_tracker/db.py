@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS refunds (
     needs_review    BOOLEAN DEFAULT FALSE, -- product had no config rule
     status          VARCHAR DEFAULT 'pending',  -- pending | done | failed
     reason          VARCHAR,
+    bank_txn_code   VARCHAR,               -- bank's transaction id (from result)
     batch_id        VARCHAR,
     generated_at    TIMESTAMP,
     resolved_at     TIMESTAMP
@@ -100,6 +101,10 @@ class Store:
         self._lock = threading.RLock()
         self.con = duckdb.connect(self.conn_str)
         self.con.execute(_SCHEMA)
+        # Migration for pre-existing DBs (schema above only runs for new tables).
+        self.con.execute(
+            "ALTER TABLE refunds ADD COLUMN IF NOT EXISTS bank_txn_code VARCHAR"
+        )
 
     def close(self):
         self.con.close()
@@ -277,6 +282,7 @@ class Store:
             remark = (res.get("payment_detail") or "").strip()
             status = (res.get("status") or "").strip().lower()
             reason = res.get("reason") or None
+            bank_code = (res.get("bank_txn_code") or "").strip()
             if not ref_no and not account and not remark:
                 updated["unknown_ref"] += 1
                 continue
@@ -288,10 +294,12 @@ class Store:
                 updated["other"] += 1
                 continue
             if ref_no:
-                ref_rows.append({"ref_no": ref_no, "status": norm, "reason": reason})
+                ref_rows.append({"ref_no": ref_no, "status": norm,
+                                 "reason": reason, "bank_txn_code": bank_code})
             else:
                 fallback.append({"account": account, "remark": remark,
-                                 "status": norm, "reason": reason})
+                                 "status": norm, "reason": reason,
+                                 "bank_txn_code": bank_code})
 
         # -- Bulk path: one UPDATE via join, regardless of row count ---------
         if ref_rows:
@@ -304,8 +312,10 @@ class Store:
             updated["done"] += int(counts.get("done", 0))
             updated["failed"] += int(counts.get("failed", 0))
             updated["unknown_ref"] += len(df) - sum(int(v) for v in counts.values())
+            # Keep any existing bank code when the incoming one is blank.
             self.con.execute(
                 "UPDATE refunds r SET status = s.status, reason = s.reason, "
+                "bank_txn_code = COALESCE(NULLIF(s.bank_txn_code, ''), r.bank_txn_code), "
                 "resolved_at = CASE WHEN s.status = 'done' THEN ? ELSE NULL END "
                 "FROM res_stage s WHERE r.ref_no = s.ref_no",
                 [now],
@@ -326,8 +336,10 @@ class Store:
             if len(matches) > 1:
                 updated["ambiguous"] += 1
             self.con.execute(
-                "UPDATE refunds SET status=?, reason=?, resolved_at=? WHERE ref_no=?",
-                [fb["status"], fb["reason"],
+                "UPDATE refunds SET status=?, reason=?, "
+                "bank_txn_code=COALESCE(NULLIF(?, ''), bank_txn_code), "
+                "resolved_at=? WHERE ref_no=?",
+                [fb["status"], fb["reason"], fb["bank_txn_code"],
                  now if fb["status"] == "done" else None, matches[0][0]],
             )
             updated[fb["status"]] += 1
@@ -355,33 +367,17 @@ class Store:
         return {r[0]: (int(r[1]), int(r[2])) for r in rows if r[0]}
 
     # -- transaction lookup -------------------------------------------------
-    @_synchronized
-    def transaction_lookup(self, order_id=None, account=None, charge_from=None,
-                           charge_to=None, refund_from=None, refund_to=None,
-                           kinds=None, statuses=None):
-        """Transaction-centric lookup. Returns *every* insurance charge — both
-        the legitimate first charge ("Gốc") and each later duplicate ("Trùng")
-        — so it doubles as a transaction search rather than only a refund log.
-
-        Each row carries the transaction's own details plus its refund state:
-          * Phân loại       — Gốc / Trùng (from is_duplicate)
-          * Trạng thái hoàn — refund status for duplicates (Chờ/Hoàn thành/
-            Thất bại); "—" for originals, which never need a refund. A duplicate
-            with no refund row yet is treated as 'pending' (Chờ).
-          * Ngày hoàn       — resolved_at (duplicates that are done)
-          * Mã GD gốc       — the original charge's ref (dup_of_ref)
-          * Ngày thu phí gốc — the original charge's transaction date
-
-        Filters: order_id / account (contains), charge-date range (trans date),
-        refund-date range (resolved_at), kind list (is_duplicate booleans), and
-        effective-refund-status list. Returns a pandas DataFrame with Vietnamese
-        column headers.
-        """
+    @staticmethod
+    def _lookup_where(ref_no, order_id, account, charge_from, charge_to,
+                      refund_from, refund_to, kinds, statuses):
+        """Build the shared WHERE clause + params for the lookup/count queries."""
         # Effective refund status: originals -> 'none'; duplicates -> refund
         # status, defaulting to 'pending' when no refund row exists yet.
         eff_status = ("COALESCE(r.status, CASE WHEN t.is_duplicate "
                       "THEN 'pending' ELSE 'none' END)")
         where, params = ["1=1"], []
+        if ref_no:
+            where.append("t.ref_no ILIKE ?"); params.append(f"%{ref_no}%")
         if order_id:
             where.append("t.order_id ILIKE ?"); params.append(f"%{order_id}%")
         if account:
@@ -405,9 +401,37 @@ class Store:
         if statuses:
             where.append(eff_status + " IN (" + ",".join(["?"] * len(statuses)) + ")")
             params.extend(statuses)
+        return " AND ".join(where), params
+
+    @_synchronized
+    def transaction_lookup_count(self, ref_no=None, order_id=None, account=None,
+                                 charge_from=None, charge_to=None, refund_from=None,
+                                 refund_to=None, kinds=None, statuses=None) -> int:
+        """Total rows matching the lookup filters (for pagination)."""
+        where, params = self._lookup_where(ref_no, order_id, account, charge_from,
+                                            charge_to, refund_from, refund_to,
+                                            kinds, statuses)
+        return self.con.execute(
+            f"SELECT COUNT(*) FROM transactions t "
+            f"LEFT JOIN refunds r ON r.ref_no = t.ref_no WHERE {where}", params
+        ).fetchone()[0]
+
+    @_synchronized
+    def transaction_lookup(self, ref_no=None, order_id=None, account=None,
+                           charge_from=None, charge_to=None, refund_from=None,
+                           refund_to=None, kinds=None, statuses=None,
+                           limit=1000, offset=0):
+        """Transaction-centric lookup (paginated via limit/offset). Returns every
+        insurance charge — the legitimate first charge ("Gốc") and each later
+        duplicate ("Trùng") — with its details and refund state, as a pandas
+        DataFrame with Vietnamese column headers.
+        """
+        where, params = self._lookup_where(ref_no, order_id, account, charge_from,
+                                            charge_to, refund_from, refund_to,
+                                            kinds, statuses)
         sql = f"""
             SELECT
-                t.ref_no                         AS "Mã GD",
+                t.ref_no                         AS "Mã tham chiếu",
                 CASE WHEN t.is_duplicate THEN 'Trùng' ELSE 'Gốc' END AS "Phân loại",
                 t.order_id                       AS "OrderID",
                 t.cif                            AS "CIF",
@@ -424,16 +448,72 @@ class Store:
                     ELSE 'Chờ'
                 END                              AS "Trạng thái hoàn",
                 strftime(r.resolved_at, '%d/%m/%Y %H:%M:%S') AS "Ngày hoàn",
-                t.dup_of_ref                     AS "Mã GD gốc",
+                r.bank_txn_code                  AS "FT GD hoàn",
+                t.dup_of_ref                     AS "Mã tham chiếu gốc",
                 o.trans_date                     AS "Ngày thu phí gốc",
                 r.reason                         AS "Lý do"
             FROM transactions t
             LEFT JOIN refunds r ON r.ref_no = t.ref_no
             LEFT JOIN transactions o ON o.ref_no = t.dup_of_ref
-            WHERE {' AND '.join(where)}
+            WHERE {where}
             ORDER BY t.trans_ts DESC NULLS LAST, t.ref_no
+            LIMIT ? OFFSET ?
         """
-        return self.con.execute(sql, params).df()
+        return self.con.execute(sql, params + [int(limit), int(offset)]).df()
+
+    # -- single-case manual entry -------------------------------------------
+    @_synchronized
+    def lookup_by_ref(self, ref_no: str) -> dict | None:
+        """Look up one transaction by its reference. Returns a dict of its
+        details + current refund state (or None if the ref isn't found)."""
+        ref_no = (ref_no or "").strip()
+        if not ref_no:
+            return None
+        row = self.con.execute(
+            """
+            SELECT t.ref_no, t.is_duplicate, t.order_id, t.cif, t.product, t.ky,
+                   t.corr_account, t.corr_name, t.trans_date, t.dup_of_ref,
+                   r.status, r.reason, r.bank_txn_code, r.amount
+            FROM transactions t
+            LEFT JOIN refunds r ON r.ref_no = t.ref_no
+            WHERE t.ref_no = ?
+            """,
+            [ref_no],
+        ).fetchone()
+        if not row:
+            return None
+        cols = ["ref_no", "is_duplicate", "order_id", "cif", "product", "ky",
+                "corr_account", "corr_name", "trans_date", "dup_of_ref",
+                "status", "reason", "bank_txn_code", "amount"]
+        return dict(zip(cols, row))
+
+    @_synchronized
+    def apply_manual(self, ref_no: str, status: str, bank_txn_code: str = "",
+                     reason: str | None = None) -> dict:
+        """Update one case entered on-screen. Ensures a refund row exists for the
+        duplicate (creating it from the transaction if needed), then applies the
+        status / bank code / reason. Returns {'ok': bool, 'msg': str}."""
+        from .refund_file import build_refund_rows  # local import: no cycle
+        ref_no = (ref_no or "").strip()
+        info = self.lookup_by_ref(ref_no)
+        if info is None:
+            return {"ok": False, "msg": f"Không tìm thấy giao dịch với mã {ref_no}."}
+        if not info["is_duplicate"]:
+            return {"ok": False,
+                    "msg": f"Giao dịch {ref_no} không phải giao dịch trùng — không cần hoàn."}
+        # Build (or ensure) the refund row from the pending-duplicate tuple.
+        tup = self.con.execute(
+            "SELECT ref_no, dedup_key, cif, product, trans_date, corr_account, "
+            "corr_name, corr_bank, credit, ky, dup_of_ref FROM transactions "
+            "WHERE ref_no = ?", [ref_no],
+        ).fetchone()
+        self.ensure_pending_refunds(build_refund_rows([tup]))
+        outcome = self.apply_results([{
+            "ref_no": ref_no, "status": status, "reason": reason,
+            "bank_txn_code": bank_txn_code,
+        }])
+        norm = "hoàn thành" if outcome["done"] else "thất bại" if outcome["failed"] else status
+        return {"ok": True, "msg": f"Đã cập nhật case {ref_no} → {norm}."}
 
     # -- stats --------------------------------------------------------------
     @_synchronized

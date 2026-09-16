@@ -123,7 +123,9 @@ REFUND_COL = {
 REFUND_REF_SEP = " - "
 # Result-import: statuses are read from columns appended AFTER the template's
 # own columns (O = 15), so they never collide with real template fields.
-REFUND_STATUS_COL = 16  # P
-REFUND_REASON_COL = 17  # Q
+REFUND_STATUS_COL = 16    # P
+REFUND_REASON_COL = 17    # Q
+REFUND_BANKCODE_COL = 18  # R
 REFUND_STATUS_HEADER = "Trạng thái (Done/Fail)"
 REFUND_REASON_HEADER = "Lý do (không bắt buộc)"
+REFUND_BANKCODE_HEADER = "FT GD hoàn"

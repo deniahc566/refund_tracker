@@ -64,7 +64,8 @@ def write_refund_file(refund_rows: list[dict], out_path: str) -> str:
     # headers) so ops can fill results in the same file that is re-imported.
     tmpl_hdr = ws.cell(row=hrow, column=C["remark"])  # copy style from "Nội dung"
     for col, text in ((config.REFUND_STATUS_COL, config.REFUND_STATUS_HEADER),
-                      (config.REFUND_REASON_COL, config.REFUND_REASON_HEADER)):
+                      (config.REFUND_REASON_COL, config.REFUND_REASON_HEADER),
+                      (config.REFUND_BANKCODE_COL, config.REFUND_BANKCODE_HEADER)):
         c = ws.cell(row=hrow, column=col, value=text)
         c.font = copy.copy(tmpl_hdr.font)
         c.fill = copy.copy(tmpl_hdr.fill)
@@ -74,6 +75,8 @@ def write_refund_file(refund_rows: list[dict], out_path: str) -> str:
         openpyxl.utils.get_column_letter(config.REFUND_STATUS_COL)].width = 20
     ws.column_dimensions[
         openpyxl.utils.get_column_letter(config.REFUND_REASON_COL)].width = 30
+    ws.column_dimensions[
+        openpyxl.utils.get_column_letter(config.REFUND_BANKCODE_COL)].width = 24
 
     r = config.REFUND_DATA_START
     for i, row in enumerate(refund_rows, start=1):

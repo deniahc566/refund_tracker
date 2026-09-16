@@ -39,6 +39,7 @@ def parse_result_file(path: str) -> list[dict]:
             "payment_detail": remark,
             "status": str(get(config.REFUND_STATUS_COL)).strip(),
             "reason": str(get(config.REFUND_REASON_COL)).strip() or None,
+            "bank_txn_code": str(get(config.REFUND_BANKCODE_COL)).strip(),
         })
     wb.close()
     return results

@@ -230,37 +230,89 @@ with tab_queue:
 
 # --- 3. Import results -----------------------------------------------------
 with tab_import:
-    st.subheader("Nhập file kết quả đã thực hiện")
-    res_up = st.file_uploader(
-        "File hoàn phí đã thực hiện (.xlsx)",
-        type=["xlsx"],
-        key=f"result_{st.session_state.get('result_key', 0)}",
-    )
-    if res_up is not None:
-        results = parse_result_file(_save_bytes(res_up.name, res_up.getvalue()))
-        st.caption(f"**{res_up.name}** — đọc được {len(results)} dòng kết quả.")
-        st.dataframe(
-            pd.DataFrame(results).rename(columns={
-                "ref_no": "Mã tham chiếu", "beneficiary_account": "TK hưởng",
-                "payment_detail": "Nội dung", "status": "Trạng thái", "reason": "Lý do",
-            }),
-            use_container_width=True,
-        )
-        if st.button("Cập nhật kết quả", type="primary", disabled=not results):
-            st.session_state["result_outcome"] = store.apply_results(results)
-            # Clear the uploader (fresh key) so the file doesn't retain.
-            st.session_state["result_key"] = st.session_state.get("result_key", 0) + 1
-            st.rerun()
+    st.subheader("Nhập kết quả")
 
-    # Outcome persists after the uploaded file is cleared.
-    oc = st.session_state.get("result_outcome")
-    if oc:
-        st.success(
-            f"Hoàn thành: {oc['done']} · Thất bại (trả về hàng chờ): "
-            f"{oc['failed']} · Không khớp: {oc['unknown_ref']} · "
-            f"Nhập nhằng (khớp >1 theo TK+nội dung): {oc['ambiguous']} · "
-            f"Trạng thái không nhận diện: {oc['other']}"
+    up_tab, one_tab = st.tabs(["Theo file", "Từng case"])
+
+    # -- 3a. Import by file --------------------------------------------------
+    with up_tab:
+        res_up = st.file_uploader(
+            "File hoàn phí đã thực hiện (.xlsx)",
+            type=["xlsx"],
+            key=f"result_{st.session_state.get('result_key', 0)}",
         )
+        if res_up is not None:
+            results = parse_result_file(_save_bytes(res_up.name, res_up.getvalue()))
+            st.caption(f"**{res_up.name}** — đọc được {len(results)} dòng kết quả.")
+            st.dataframe(
+                pd.DataFrame(results).rename(columns={
+                    "ref_no": "Mã tham chiếu", "beneficiary_account": "TK hưởng",
+                    "payment_detail": "Nội dung", "status": "Trạng thái",
+                    "reason": "Lý do", "bank_txn_code": "FT GD hoàn",
+                }),
+                use_container_width=True,
+            )
+            if st.button("Cập nhật kết quả", type="primary", disabled=not results):
+                st.session_state["result_outcome"] = store.apply_results(results)
+                st.session_state["result_key"] = st.session_state.get("result_key", 0) + 1
+                st.rerun()
+
+        oc = st.session_state.get("result_outcome")
+        if oc:
+            st.success(
+                f"Hoàn thành: {oc['done']} · Thất bại (trả về hàng chờ): "
+                f"{oc['failed']} · Không khớp: {oc['unknown_ref']} · "
+                f"Nhập nhằng (khớp >1 theo TK+nội dung): {oc['ambiguous']} · "
+                f"Trạng thái không nhận diện: {oc['other']}"
+            )
+
+    # -- 3b. Enter one case on-screen ---------------------------------------
+    with one_tab:
+        st.caption("Nhập mã tham chiếu → tra cứu giao dịch trùng → nhập trạng "
+                   "thái hoàn và Mã giao dịch Ngân hàng.")
+        ref_in = st.text_input("Mã tham chiếu", key="one_ref")
+        if st.button("Tra cứu", key="one_lookup"):
+            st.session_state["one_searched"] = True
+            st.session_state["one_info"] = store.lookup_by_ref(ref_in)
+            st.session_state["one_msg"] = None
+
+        if st.session_state.get("one_searched"):
+            info = st.session_state.get("one_info")
+            if info is None:
+                st.info("Không tìm thấy giao dịch với mã tham chiếu này.")
+            elif not info["is_duplicate"]:
+                st.warning(
+                    f"Giao dịch **{info['ref_no']}** là giao dịch **gốc**, không "
+                    f"phải giao dịch trùng — không cần hoàn."
+                )
+            else:
+                cur = {"done": "Hoàn thành", "failed": "Thất bại"}.get(
+                    info["status"], "Chờ")
+                st.markdown(
+                    f"**OrderID:** {info['order_id']} · **CIF:** {info['cif']} · "
+                    f"**Sản phẩm:** {info['product']} · **Kỳ:** {info['ky']}  \n"
+                    f"**TK hưởng:** {info['corr_account']} — {info['corr_name']}  \n"
+                    f"**Ngày thu phí:** {info['trans_date']} · "
+                    f"**Trạng thái hiện tại:** {cur}"
+                )
+                c1, c2 = st.columns(2)
+                st_label = c1.selectbox("Trạng thái hoàn", ["Done", "Fail"],
+                                        key="one_status")
+                bankcode = c2.text_input("FT GD hoàn", key="one_bank",
+                                         value=info.get("bank_txn_code") or "")
+                reason = st.text_input("Lý do (không bắt buộc)", key="one_reason",
+                                       value=info.get("reason") or "")
+                if st.button("Cập nhật case", type="primary", key="one_apply"):
+                    r = store.apply_manual(info["ref_no"], st_label,
+                                           bankcode.strip(), reason.strip() or None)
+                    st.session_state["one_msg"] = r
+                    if r["ok"]:
+                        st.session_state["one_info"] = store.lookup_by_ref(info["ref_no"])
+                    st.rerun()
+
+        msg = st.session_state.get("one_msg")
+        if msg:
+            (st.success if msg["ok"] else st.warning)(msg["msg"])
 
 
 # --- 4. Tra cứu giao dịch --------------------------------------------------
@@ -292,9 +344,10 @@ def _style_lookup(df: pd.DataFrame):
 
 with tab_history:
     st.subheader("Tra cứu giao dịch")
-    c1, c2 = st.columns(2)
-    f_order = c1.text_input("OrderID", key="h_order")
-    f_stk = c2.text_input("STK (tài khoản hưởng)", key="h_stk")
+    r1a, r1b, r1c = st.columns(3)
+    f_ref = r1a.text_input("Mã tham chiếu", key="h_ref")
+    f_order = r1b.text_input("OrderID", key="h_order")
+    f_stk = r1c.text_input("STK (tài khoản hưởng)", key="h_stk")
     c3, c4 = st.columns(2)
     charge_rng = c3.date_input("Ngày thu phí (từ – đến)", value=(),
                                format="DD/MM/YYYY", key="h_charge")
@@ -317,65 +370,87 @@ with tab_history:
 
     cf, ct = _range(charge_rng)
     rf, rt = _range(refund_rng)
-    hist = store.transaction_lookup(
-        order_id=f_order.strip() or None,
-        account=f_stk.strip() or None,
-        charge_from=cf, charge_to=ct,
-        refund_from=rf, refund_to=rt,
-        kinds=[_KIND_LABELS[k] for k in picked_kind] or None,
-        statuses=[_STATUS_LABELS[s] for s in picked_status] or None,
-    )
-    # "Số tiền" is a fee amount — show it as a whole number (nullable Int64 so
-    # it stays integer in the styled view, the plain view, and the CSV export).
-    if "Số tiền" in hist.columns:
-        hist["Số tiền"] = hist["Số tiền"].round().astype("Int64")
-    _col_cfg = {"Số tiền": st.column_config.NumberColumn("Số tiền", format="localized")}
+    _PER = 1000  # rows per page
 
-    n_dup = int((hist["Phân loại"] == "Trùng").sum()) if len(hist) else 0
-    st.write(f"**{len(hist)}** giao dịch · **{n_dup}** trùng.")
-    # The pandas Styler caps rendering at 262,144 cells — the whole ledger blows
-    # past that. Color the categorical columns only for a filtered/small result;
-    # otherwise render plainly (and hint that filtering enables the colors).
-    if 0 < hist.size <= 262_144:
+    # Only query when the user searches — never preload the whole ledger.
+    if st.button("Tra cứu", type="primary", key="h_search"):
+        st.session_state["hist_filters"] = dict(
+            ref_no=f_ref.strip() or None,
+            order_id=f_order.strip() or None,
+            account=f_stk.strip() or None,
+            charge_from=cf, charge_to=ct,
+            refund_from=rf, refund_to=rt,
+            kinds=[_KIND_LABELS[k] for k in picked_kind] or None,
+            statuses=[_STATUS_LABELS[s] for s in picked_status] or None,
+        )
+        st.session_state["hist_page"] = 1
+        st.session_state.pop("hist_csv", None)  # invalidate prepared export
+
+    filters = st.session_state.get("hist_filters")
+    if filters is not None:
+        total = store.transaction_lookup_count(**filters)
+        pages = max(1, (total + _PER - 1) // _PER)
+        # Clamp a stale page from a previous (larger) result before the widget.
+        if st.session_state.get("hist_page", 1) > pages:
+            st.session_state["hist_page"] = pages
+        if pages > 1:
+            pcol, _ = st.columns([1, 3])
+            page = pcol.number_input(f"Trang (1–{pages})", min_value=1,
+                                     max_value=pages, step=1, key="hist_page")
+        else:
+            page = 1
+        st.write(f"**{total:,}** giao dịch · trang **{page}/{pages}**")
+
+        hist = store.transaction_lookup(**filters, limit=_PER,
+                                        offset=(page - 1) * _PER)
+        # "Số tiền" is a fee amount — show it as a whole number (nullable Int64).
+        if "Số tiền" in hist.columns:
+            hist["Số tiền"] = hist["Số tiền"].round().astype("Int64")
+        _col_cfg = {"Số tiền": st.column_config.NumberColumn("Số tiền", format="localized")}
+
+        # A page is at most 1000 rows -> always under the Styler cell cap.
         st.dataframe(_style_lookup(hist), use_container_width=True,
                      hide_index=True, column_config=_col_cfg)
-    else:
-        st.dataframe(hist, use_container_width=True, hide_index=True,
-                     column_config=_col_cfg)
-        if hist.size:
-            st.caption("Lọc bớt kết quả để tô màu cột Phân loại / Trạng thái hoàn.")
-    if len(hist):
-        # Encode the active filters into the download name so exports are
-        # self-describing, e.g. tra_cuu_giao_dich_order-ORD1_thuphi-20260101-
-        # 20260131_trung_cho.csv. No filters -> the plain base name.
-        _KIND_SLUG = {"Gốc": "goc", "Trùng": "trung"}
-        _STATUS_SLUG = {"Chờ": "cho", "Hoàn thành": "hoanthanh", "Thất bại": "thatbai"}
+        if total:
+            # Encode the active filters into the download name so exports are
+            # self-describing, e.g. tra_cuu_giao_dich_order-ORD1_thuphi-
+            # 20260101-20260131_trung_cho.csv. No filters -> the plain base name.
+            _KIND_SLUG = {"Gốc": "goc", "Trùng": "trung"}
+            _STATUS_SLUG = {"Chờ": "cho", "Hoàn thành": "hoanthanh", "Thất bại": "thatbai"}
 
-        def _slug(s: str) -> str:
-            return re.sub(r"[^0-9A-Za-z]+", "", str(s))
+            def _slug(s: str) -> str:
+                return re.sub(r"[^0-9A-Za-z]+", "", str(s))
 
-        def _daterange(a, b) -> str:
-            return (a.strftime("%Y%m%d") if a else "") + "-" + (b.strftime("%Y%m%d") if b else "")
+            def _daterange(a, b) -> str:
+                return (a.strftime("%Y%m%d") if a else "") + "-" + (b.strftime("%Y%m%d") if b else "")
 
-        parts = ["tra_cuu_giao_dich"]
-        if f_order.strip():
-            parts.append("order-" + _slug(f_order))
-        if f_stk.strip():
-            parts.append("stk-" + _slug(f_stk))
-        if cf or ct:
-            parts.append("thuphi-" + _daterange(cf, ct))
-        if rf or rt:
-            parts.append("hoan-" + _daterange(rf, rt))
-        if picked_kind:
-            parts.append("-".join(_KIND_SLUG[k] for k in picked_kind))
-        if picked_status:
-            parts.append("-".join(_STATUS_SLUG[s] for s in picked_status))
-        fname = "_".join(parts) + ".csv"
+            parts = ["tra_cuu_giao_dich"]
+            if f_ref.strip():
+                parts.append("ref-" + _slug(f_ref))
+            if f_order.strip():
+                parts.append("order-" + _slug(f_order))
+            if f_stk.strip():
+                parts.append("stk-" + _slug(f_stk))
+            if cf or ct:
+                parts.append("thuphi-" + _daterange(cf, ct))
+            if rf or rt:
+                parts.append("hoan-" + _daterange(rf, rt))
+            if picked_kind:
+                parts.append("-".join(_KIND_SLUG[k] for k in picked_kind))
+            if picked_status:
+                parts.append("-".join(_STATUS_SLUG[s] for s in picked_status))
+            fname = "_".join(parts) + ".csv"
 
-        st.download_button(
-            "⬇ Tải CSV",
-            hist.to_csv(index=False).encode("utf-8-sig"),
-            file_name=fname,
-            mime="text/csv",
-            key="hist_csv",
-        )
+            # Export ALL matching rows (not just the current page). Build once on
+            # demand — querying every row can be heavy for a broad search.
+            if st.button(f"Chuẩn bị CSV (tất cả {total:,} dòng)", key="hist_prep"):
+                allrows = store.transaction_lookup(**filters, limit=10_000_000,
+                                                   offset=0)
+                st.session_state["hist_csv"] = (
+                    fname, allrows.to_csv(index=False).encode("utf-8-sig"))
+            prep = st.session_state.get("hist_csv")
+            if prep:
+                st.download_button(
+                    "⬇ Tải CSV (tất cả)", prep[1], file_name=prep[0],
+                    mime="text/csv", key="hist_csv_dl",
+                )
