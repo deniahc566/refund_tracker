@@ -4,7 +4,7 @@ Flow:
   1. Upload bank statement  -> parse + ingest (idempotent), detect duplicates
   2. Refund queue           -> generate the 'form điền case hoàn' file
   3. Import results         -> mark refunds done/failed (1:1, never regenerate)
-  4. Dashboard              -> ledger stats & history
+  4. Transaction lookup     -> search every charge (Gốc/Trùng) + refund state
 
 Run:  .\.venv\Scripts\streamlit.exe run Refund_Tracker\app.py
 """
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -73,7 +74,7 @@ st.markdown(
 st.divider()
 
 tab_up, tab_queue, tab_import, tab_history = st.tabs(
-    ["1 · Tải sao kê", "2 · Hàng chờ hoàn", "3 · Nhập kết quả", "4 · Lịch sử hoàn phí"]
+    ["1 · Tải sao kê", "2 · Hàng chờ hoàn", "3 · Nhập kết quả", "4 · Tra cứu giao dịch"]
 )
 
 
@@ -262,11 +263,35 @@ with tab_import:
         )
 
 
-# --- 4. Lịch sử hoàn phí ---------------------------------------------------
-_STATUS_LABELS = {"Hoàn thành": "done", "Thất bại": "failed", "Chờ": "pending"}
+# --- 4. Tra cứu giao dịch --------------------------------------------------
+_STATUS_LABELS = {"Chờ": "pending", "Hoàn thành": "done", "Thất bại": "failed"}
+_KIND_LABELS = {"Gốc": False, "Trùng": True}
+
+# Color the two categorical columns to match the design system (see ui.py):
+# duplicates/failed in red, done in green, pending in amber, originals muted.
+_KIND_COLOR = {"Trùng": "#F32B2B", "Gốc": "#00BF36"}
+_STATUS_COLOR = {"Hoàn thành": "#00BF36", "Thất bại": "#F32B2B",
+                 "Chờ": "#FF9900", "—": "#888888"}
+
+
+def _style_lookup(df: pd.DataFrame):
+    """A pandas Styler that tints Phân loại / Trạng thái hoàn by value."""
+    sty = df.style
+    if "Phân loại" in df.columns:
+        sty = sty.map(
+            lambda v: f"color:{_KIND_COLOR.get(v, '#212121')};font-weight:600",
+            subset=["Phân loại"],
+        )
+    if "Trạng thái hoàn" in df.columns:
+        sty = sty.map(
+            lambda v: f"color:{_STATUS_COLOR.get(v, '#212121')};font-weight:600",
+            subset=["Trạng thái hoàn"],
+        )
+    return sty
+
 
 with tab_history:
-    st.subheader("Lịch sử hoàn phí")
+    st.subheader("Tra cứu giao dịch")
     c1, c2 = st.columns(2)
     f_order = c1.text_input("OrderID", key="h_order")
     f_stk = c2.text_input("STK (tài khoản hưởng)", key="h_stk")
@@ -275,7 +300,10 @@ with tab_history:
                                format="DD/MM/YYYY", key="h_charge")
     refund_rng = c4.date_input("Ngày hoàn (từ – đến)", value=(),
                                format="DD/MM/YYYY", key="h_refund")
-    picked_status = st.multiselect("Trạng thái", list(_STATUS_LABELS.keys()),
+    c5, c6 = st.columns(2)
+    picked_kind = c5.multiselect("Phân loại", list(_KIND_LABELS.keys()),
+                                 key="h_kind")
+    picked_status = c6.multiselect("Trạng thái hoàn", list(_STATUS_LABELS.keys()),
                                    key="h_status")
 
     def _range(v):
@@ -289,20 +317,65 @@ with tab_history:
 
     cf, ct = _range(charge_rng)
     rf, rt = _range(refund_rng)
-    hist = store.refund_history(
+    hist = store.transaction_lookup(
         order_id=f_order.strip() or None,
         account=f_stk.strip() or None,
         charge_from=cf, charge_to=ct,
         refund_from=rf, refund_to=rt,
+        kinds=[_KIND_LABELS[k] for k in picked_kind] or None,
         statuses=[_STATUS_LABELS[s] for s in picked_status] or None,
     )
-    st.write(f"**{len(hist)}** kết quả.")
-    st.dataframe(hist, use_container_width=True, hide_index=True)
+    # "Số tiền" is a fee amount — show it as a whole number (nullable Int64 so
+    # it stays integer in the styled view, the plain view, and the CSV export).
+    if "Số tiền" in hist.columns:
+        hist["Số tiền"] = hist["Số tiền"].round().astype("Int64")
+    _col_cfg = {"Số tiền": st.column_config.NumberColumn("Số tiền", format="localized")}
+
+    n_dup = int((hist["Phân loại"] == "Trùng").sum()) if len(hist) else 0
+    st.write(f"**{len(hist)}** giao dịch · **{n_dup}** trùng.")
+    # The pandas Styler caps rendering at 262,144 cells — the whole ledger blows
+    # past that. Color the categorical columns only for a filtered/small result;
+    # otherwise render plainly (and hint that filtering enables the colors).
+    if 0 < hist.size <= 262_144:
+        st.dataframe(_style_lookup(hist), use_container_width=True,
+                     hide_index=True, column_config=_col_cfg)
+    else:
+        st.dataframe(hist, use_container_width=True, hide_index=True,
+                     column_config=_col_cfg)
+        if hist.size:
+            st.caption("Lọc bớt kết quả để tô màu cột Phân loại / Trạng thái hoàn.")
     if len(hist):
+        # Encode the active filters into the download name so exports are
+        # self-describing, e.g. tra_cuu_giao_dich_order-ORD1_thuphi-20260101-
+        # 20260131_trung_cho.csv. No filters -> the plain base name.
+        _KIND_SLUG = {"Gốc": "goc", "Trùng": "trung"}
+        _STATUS_SLUG = {"Chờ": "cho", "Hoàn thành": "hoanthanh", "Thất bại": "thatbai"}
+
+        def _slug(s: str) -> str:
+            return re.sub(r"[^0-9A-Za-z]+", "", str(s))
+
+        def _daterange(a, b) -> str:
+            return (a.strftime("%Y%m%d") if a else "") + "-" + (b.strftime("%Y%m%d") if b else "")
+
+        parts = ["tra_cuu_giao_dich"]
+        if f_order.strip():
+            parts.append("order-" + _slug(f_order))
+        if f_stk.strip():
+            parts.append("stk-" + _slug(f_stk))
+        if cf or ct:
+            parts.append("thuphi-" + _daterange(cf, ct))
+        if rf or rt:
+            parts.append("hoan-" + _daterange(rf, rt))
+        if picked_kind:
+            parts.append("-".join(_KIND_SLUG[k] for k in picked_kind))
+        if picked_status:
+            parts.append("-".join(_STATUS_SLUG[s] for s in picked_status))
+        fname = "_".join(parts) + ".csv"
+
         st.download_button(
             "⬇ Tải CSV",
             hist.to_csv(index=False).encode("utf-8-sig"),
-            file_name="lich_su_hoan_phi.csv",
+            file_name=fname,
             mime="text/csv",
             key="hist_csv",
         )

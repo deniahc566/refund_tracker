@@ -354,16 +354,33 @@ class Store:
         ).fetchall()
         return {r[0]: (int(r[1]), int(r[2])) for r in rows if r[0]}
 
-    # -- history / lookup ---------------------------------------------------
+    # -- transaction lookup -------------------------------------------------
     @_synchronized
-    def refund_history(self, order_id=None, account=None, charge_from=None,
-                       charge_to=None, refund_from=None, refund_to=None,
-                       statuses=None):
-        """Searchable refund history. Each row is a refunded/duplicate charge
-        joined to its original ("giao dịch gốc" via dup_of_ref). Filters:
-        order_id / account (contains), charge-date range (on the duplicate's
-        trans date), refund-date range (resolved_at), and status list.
-        Returns a pandas DataFrame with Vietnamese column headers."""
+    def transaction_lookup(self, order_id=None, account=None, charge_from=None,
+                           charge_to=None, refund_from=None, refund_to=None,
+                           kinds=None, statuses=None):
+        """Transaction-centric lookup. Returns *every* insurance charge — both
+        the legitimate first charge ("Gốc") and each later duplicate ("Trùng")
+        — so it doubles as a transaction search rather than only a refund log.
+
+        Each row carries the transaction's own details plus its refund state:
+          * Phân loại       — Gốc / Trùng (from is_duplicate)
+          * Trạng thái hoàn — refund status for duplicates (Chờ/Hoàn thành/
+            Thất bại); "—" for originals, which never need a refund. A duplicate
+            with no refund row yet is treated as 'pending' (Chờ).
+          * Ngày hoàn       — resolved_at (duplicates that are done)
+          * Mã GD gốc       — the original charge's ref (dup_of_ref)
+          * Ngày thu phí gốc — the original charge's transaction date
+
+        Filters: order_id / account (contains), charge-date range (trans date),
+        refund-date range (resolved_at), kind list (is_duplicate booleans), and
+        effective-refund-status list. Returns a pandas DataFrame with Vietnamese
+        column headers.
+        """
+        # Effective refund status: originals -> 'none'; duplicates -> refund
+        # status, defaulting to 'pending' when no refund row exists yet.
+        eff_status = ("COALESCE(r.status, CASE WHEN t.is_duplicate "
+                      "THEN 'pending' ELSE 'none' END)")
         where, params = ["1=1"], []
         if order_id:
             where.append("t.order_id ILIKE ?"); params.append(f"%{order_id}%")
@@ -377,30 +394,44 @@ class Store:
             where.append("CAST(r.resolved_at AS DATE) >= ?"); params.append(str(refund_from))
         if refund_to:
             where.append("CAST(r.resolved_at AS DATE) <= ?"); params.append(str(refund_to))
+        if kinds:  # subset of {True, False} on is_duplicate
+            clauses = []
+            if True in kinds:
+                clauses.append("t.is_duplicate")
+            if False in kinds:
+                clauses.append("NOT t.is_duplicate")
+            if clauses:
+                where.append("(" + " OR ".join(clauses) + ")")
         if statuses:
-            where.append("r.status IN (" + ",".join(["?"] * len(statuses)) + ")")
+            where.append(eff_status + " IN (" + ",".join(["?"] * len(statuses)) + ")")
             params.extend(statuses)
         sql = f"""
             SELECT
+                t.ref_no                         AS "Mã GD",
+                CASE WHEN t.is_duplicate THEN 'Trùng' ELSE 'Gốc' END AS "Phân loại",
                 t.order_id                       AS "OrderID",
                 t.cif                            AS "CIF",
                 t.product                        AS "Sản phẩm",
                 t.ky                             AS "Kỳ",
                 t.corr_account                   AS "STK hưởng",
                 t.corr_name                      AS "Tên hưởng",
-                r.amount                         AS "Số tiền",
+                t.credit                         AS "Số tiền",
                 t.trans_date                     AS "Ngày thu phí",
+                CASE
+                    WHEN NOT t.is_duplicate  THEN '—'
+                    WHEN r.status = 'done'   THEN 'Hoàn thành'
+                    WHEN r.status = 'failed' THEN 'Thất bại'
+                    ELSE 'Chờ'
+                END                              AS "Trạng thái hoàn",
                 strftime(r.resolved_at, '%d/%m/%Y %H:%M:%S') AS "Ngày hoàn",
-                r.status                         AS "Trạng thái",
-                r.reason                         AS "Lý do",
-                t.ref_no                         AS "Mã GD (trùng)",
                 t.dup_of_ref                     AS "Mã GD gốc",
-                o.trans_date                     AS "Ngày thu phí (GD gốc)"
-            FROM refunds r
-            JOIN transactions t ON t.ref_no = r.ref_no
+                o.trans_date                     AS "Ngày thu phí gốc",
+                r.reason                         AS "Lý do"
+            FROM transactions t
+            LEFT JOIN refunds r ON r.ref_no = t.ref_no
             LEFT JOIN transactions o ON o.ref_no = t.dup_of_ref
             WHERE {' AND '.join(where)}
-            ORDER BY r.resolved_at DESC NULLS LAST, t.trans_ts DESC
+            ORDER BY t.trans_ts DESC NULLS LAST, t.ref_no
         """
         return self.con.execute(sql, params).df()
 
