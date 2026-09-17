@@ -57,6 +57,9 @@ def write_refund_file(refund_rows: list[dict], out_path: str) -> str:
     ranges are left untouched so the bank's validation still works."""
     wb = openpyxl.load_workbook(config.TEMPLATE_PATH)
     ws = wb[config.REFUND_SHEET] if config.REFUND_SHEET in wb.sheetnames else wb.active
+    # The BIDV template ships with this sheet protected — unlock it so ops can
+    # freely fill the Status / Reason / bank-code columns.
+    ws.protection.sheet = False
     C = config.REFUND_COL
     hrow = config.REFUND_HEADER_ROW
 
