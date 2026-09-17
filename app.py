@@ -28,6 +28,7 @@ try:
 except Exception:
     pass
 
+from refund_tracker import config
 from refund_tracker.batch import FileResult, aggregate, process_one_file
 from refund_tracker.db import Store
 from refund_tracker.refund_file import (
@@ -36,7 +37,8 @@ from refund_tracker.refund_file import (
 from refund_tracker.results import parse_result_file
 from refund_tracker.ui import header, heatmap_html, inject_theme
 
-st.set_page_config(page_title="LiteX Hoàn phí", page_icon="💸", layout="wide")
+st.set_page_config(page_title="LiteX Hoàn phí", page_icon=str(config.ICON_PATH),
+                   layout="wide")
 inject_theme()
 
 

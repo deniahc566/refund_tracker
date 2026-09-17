@@ -19,6 +19,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Refund output uses the BIDV bulk-payment template (sheet "Mẫu file_File Template").
 TEMPLATE_PATH = PROJECT_ROOT / "templates" / "bulk_payment_template.xlsx"
 DEFAULT_LOCAL_DB = PROJECT_ROOT / "refund_tracker.duckdb"
+# Branding: full LiteX logo (header) and the square X icon (favicon).
+LOGO_PATH = PROJECT_ROOT / "assets" / "logo.png"
+ICON_PATH = PROJECT_ROOT / "assets" / "icon.png"
 
 
 def _load_dotenv() -> None:

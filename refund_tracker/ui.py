@@ -13,11 +13,25 @@ Public API:
 """
 from __future__ import annotations
 
+import base64
 import calendar as _cal
 from datetime import date, timedelta
+from functools import lru_cache
 from html import escape
 
 import streamlit as st
+
+from . import config
+
+
+@lru_cache(maxsize=1)
+def _logo_data_uri() -> str:
+    """The LiteX logo as a base64 data URI (read once), or '' if unavailable."""
+    try:
+        return "data:image/png;base64," + base64.b64encode(
+            config.LOGO_PATH.read_bytes()).decode()
+    except Exception:
+        return ""
 
 # --- Design tokens (mirrors DESIGN_SYSTEM.md) ------------------------------
 PRIMARY = "#0D87E1"          # brand azure — buttons, tabs, focus
@@ -92,6 +106,11 @@ h1, h2, h3, h4,
     font-size: 30px;
     line-height: 1;
     filter: drop-shadow(0 2px 6px rgba(12,131,223,0.25));
+}}
+.litex-logo {{
+    height: 40px;
+    width: auto;
+    display: block;
 }}
 .litex-wordmark {{
     font-family: {FONT_STACK};
@@ -343,10 +362,13 @@ def header(title: str = "Refund Tracker") -> None:
     Args:
         title: the app title shown next to the wordmark.
     """
+    uri = _logo_data_uri()
+    brand = (f'<img class="litex-logo" src="{uri}" alt="LiteX">' if uri
+             else '<span class="litex-wordmark">LiteX</span>')
     st.markdown(
         f"""
         <div class="litex-header">
-            <span class="litex-wordmark">LiteX</span>
+            {brand}
             <span class="litex-divider-dot"></span>
             <span class="litex-title-block">
                 <span class="litex-title">{title}</span>
