@@ -82,6 +82,38 @@ copy Refund_Tracker\.env.example Refund_Tracker\.env
 Tabs: **1 Upload statement** → **2 Refund queue** (generate file) →
 **3 Import results** → **4 Dashboard**.
 
+## Automatic import from Gmail
+
+BIDV e-mails the daily statement from `insaoke@bidv.com.vn`, split across
+several messages ("email 1/5", "2/5", ...), each with a password-protected
+`.xlsx`. `refund_tracker/gmail_import.py` replaces the manual download/upload:
+it reads those e-mails over IMAP, decrypts each attachment, and ingests it into
+MotherDuck exactly like an upload in tab 1. Processed attachments are recorded
+in the `gmail_imports` table and skipped on later runs (ingestion is also
+idempotent on `ref_no`).
+
+The e-mailed files use a compact layout without the *đối ứng* columns; the
+parser finds columns by header text, and takes the refund account from
+`Tfr Ac:<account>` in the description.
+
+**Scheduled (GitHub Actions):** `.github/workflows/gmail_import.yml` runs daily
+at 08:30 Vietnam time (and on demand from the Actions tab). Add these repo
+secrets under *Settings → Secrets and variables → Actions*:
+
+| Secret               | Value                                                  |
+|----------------------|--------------------------------------------------------|
+| `GMAIL_USER`         | Gmail address that receives the statements             |
+| `GMAIL_APP_PASSWORD` | Google App Password (needs 2-Step Verification on)     |
+| `STATEMENT_PASSWORD` | Password that opens the `.xlsx` (DDMMYYYY)             |
+| `MOTHERDUCK_TOKEN`   | MotherDuck token                                       |
+
+**Manual / local:** set the same values in `.env`, then
+
+```powershell
+.\.venv\Scripts\python.exe -m refund_tracker.gmail_import --dry-run   # list only
+.\.venv\Scripts\python.exe -m refund_tracker.gmail_import --days 7
+```
+
 ## Deploy to Streamlit Cloud
 
 1. Push this folder to a GitHub repo (its contents at the repo **root**, so
@@ -93,7 +125,7 @@ Tabs: **1 Upload statement** → **2 Refund queue** (generate file) →
    [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example)):
    ```toml
    MOTHERDUCK_TOKEN = "your-motherduck-token"
-   MD_DATABASE = "refund_tracker"
+   MD_DATABASE = "LiteX_PO_Data"
    ```
 
 > **Use MotherDuck in the cloud.** Streamlit Cloud's filesystem is ephemeral —
@@ -107,6 +139,7 @@ Refund_Tracker/
 ├── app.py                       Streamlit UI
 ├── refund_tracker/
 │   ├── config.py                DB target, product rules, column maps
+│   ├── gmail_import.py          Gmail (IMAP) → decrypt → ingest, run daily
 │   ├── parser.py                statement .xlsx → Txn records + dedup key
 │   ├── db.py                    DuckDB/MotherDuck: ingest, dedup, queue, results
 │   ├── refund_file.py           fill the refund-form template
