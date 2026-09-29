@@ -1,5 +1,5 @@
 streamlit>=1.36
-duckdb>=1.0
+duckdb==1.5.5  # MotherDuck lags DuckDB releases; bump only when MotherDuck supports it
 openpyxl>=3.1
 python-calamine>=0.2
 pandas>=2.0
