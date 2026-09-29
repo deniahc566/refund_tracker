@@ -4,7 +4,7 @@ Environment variables (optional, loaded from a .env file if present):
     MOTHERDUCK_TOKEN   MotherDuck auth token. If set, the app connects to
                        MotherDuck cloud (md:<MD_DATABASE>). If absent, it falls
                        back to a local DuckDB file so the app still runs in dev.
-    MD_DATABASE        MotherDuck database name (default: "refund_tracker").
+    MD_DATABASE        MotherDuck database name (default: "LiteX_PO_Data").
     REFUND_DB_PATH     Local DuckDB file path used when no token is set
                        (default: <project>/refund_tracker.duckdb).
 """
@@ -48,7 +48,7 @@ def get_db_target() -> tuple[str, str]:
     """
     token = os.environ.get("MOTHERDUCK_TOKEN", "").strip()
     if token:
-        db = os.environ.get("MD_DATABASE", "refund_tracker").strip()
+        db = os.environ.get("MD_DATABASE", "LiteX_PO_Data").strip()
         # duckdb reads the token from the MOTHERDUCK_TOKEN env var automatically.
         return f"md:{db}", f"MotherDuck (md:{db})"
     local = os.environ.get("REFUND_DB_PATH", str(DEFAULT_LOCAL_DB))

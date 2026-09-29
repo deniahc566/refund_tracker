@@ -28,7 +28,7 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           STATEMENT_PASSWORD: ${{ secrets.STATEMENT_PASSWORD }}
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
-          MD_DATABASE: ${{ vars.MD_DATABASE || 'refund_tracker' }}
+          MD_DATABASE: ${{ vars.MD_DATABASE || 'LiteX_PO_Data' }}
         run: |
           if [ -z "$MOTHERDUCK_TOKEN" ]; then echo "MOTHERDUCK_TOKEN secret is required"; exit 1; fi
           python -m refund_tracker.gmail_import --days "${{ github.event.inputs.days || '3' }}"

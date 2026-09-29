@@ -125,7 +125,7 @@ secrets under *Settings → Secrets and variables → Actions*:
    [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example)):
    ```toml
    MOTHERDUCK_TOKEN = "your-motherduck-token"
-   MD_DATABASE = "refund_tracker"
+   MD_DATABASE = "LiteX_PO_Data"
    ```
 
 > **Use MotherDuck in the cloud.** Streamlit Cloud's filesystem is ephemeral —
