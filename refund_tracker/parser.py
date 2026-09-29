@@ -97,6 +97,53 @@ def _num(v) -> float:
         return 0.0
 
 
+# Header keywords (NFC-lowercased substrings) -> column key. BIDV ships two
+# layouts: the full one (STT in col B, ref_no in col P, counterparty in M-O)
+# and the compact one attached to the split "email n/5" statements (no
+# counterparty columns, ref_no in col M). Columns are located by header text;
+# anything not found falls back to the fixed COL positions.
+_HEADER_KEYS = {
+    "stt": ("stt", "(no)"),
+    "trans_date": ("ngày giao dịch", "trans.date"),
+    "eff_date": ("ngày hiệu lực", "efd.date"),
+    "trans_code": ("mã giao dịch", "trans.code"),
+    "debit": ("phát sinh nợ", "debit amount"),
+    "credit": ("phát sinh có", "credit amount"),
+    "balance": ("số dư", "(balance)"),
+    "seq_no": ("số chứng từ", "seq no"),
+    "teller_id": ("mã gdv", "teller id"),
+    "branch": ("mã cn", "(branch)"),
+    "description": ("diễn giải", "txn. description"),
+    "corr_account": ("tài khoản đối ứng",),
+    "corr_name": ("tên đối ứng",),
+    "corr_bank": ("ngân hàng đối ứng",),
+    "ref_no": ("số tham chiếu", "reference number"),
+}
+# Counterparty account embedded in the description: "REM Tfr Ac:4270804530 ..."
+_DESC_ACCOUNT = re.compile(r"Tfr Ac:\s*(\d+)", re.IGNORECASE)
+
+
+_MISSING = 10_000
+
+
+def _detect_columns(raw_rows) -> dict:
+    """Map column keys to indices from the header row(s), else fixed COL."""
+    for row in raw_rows[:40]:
+        cells = [norm(c) for c in row]
+        if not any("số tham chiếu" in c or "reference number" in c for c in cells):
+            continue
+        found: dict = {}
+        for idx, cell in enumerate(cells):
+            for key, words in _HEADER_KEYS.items():
+                if key not in found and any(cell == w or (len(w) > 4 and w in cell) for w in words):
+                    found[key] = idx
+                    break
+        if "description" in found and "ref_no" in found:
+            # Columns absent from this layout point past the row -> None.
+            return {k: found.get(k, _MISSING) for k in COL}
+    return dict(COL)
+
+
 def parse_statement(path: str) -> tuple[list[Txn], dict]:
     """Return (insurance_transactions, summary).
 
@@ -105,12 +152,12 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
     `summary` reports counts for the upload screen.
     """
     # Read with python-calamine (Rust) — ~10x faster than openpyxl. It returns
-    # ragged rows (trailing empties trimmed), so pad each row to a fixed width.
+    # ragged rows (trailing empties trimmed); get() below tolerates short rows.
     wb = CalamineWorkbook.from_path(path)
     names = wb.sheet_names
     sheet = config.STMT_SHEET if config.STMT_SHEET in names else names[0]
     raw_rows = wb.get_sheet_by_name(sheet).to_python(skip_empty_area=False)
-    width = max(COL.values()) + 1
+    cols = _detect_columns(raw_rows)
 
     total_rows = 0
     unmatched: list[str] = []
@@ -118,9 +165,8 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
     seen_refs: set[str] = set()
 
     for row in raw_rows:
-        if len(row) < width:
-            row = list(row) + [None] * (width - len(row))
-        stt = row[COL["stt"]]
+        get = lambda key: row[cols[key]] if cols[key] < len(row) else None  # noqa: E731
+        stt = get("stt")
         s = str(stt).strip()
         if s.endswith(".0"):  # tolerate numeric STT like 2.0
             s = s[:-2]
@@ -128,8 +174,8 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
             continue
         total_rows += 1
 
-        desc = str(row[COL["description"]] or "")
-        credit = _num(row[COL["credit"]])
+        desc = str(get("description") or "")
+        credit = _num(get("credit"))
         m = _DETAIL.search(desc)
         if m is None or credit <= 0:
             if credit > 0:
@@ -141,7 +187,7 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
         product = m.group("product").strip()
         ky = m.group("ky").strip()
         cif = m.group("cif").strip()
-        ref_no = str(row[COL["ref_no"]] or "").strip()
+        ref_no = str(get("ref_no") or "").strip()
         if not ref_no or ref_no in seen_refs:
             # Missing/duplicate reference within one file — skip to keep PK sane.
             continue
@@ -151,20 +197,21 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
             Txn(
                 ref_no=ref_no,
                 stt=s,
-                trans_date=str(row[COL["trans_date"]] or "").strip(),
-                trans_ts=_parse_ts(row[COL["trans_date"]]),
-                eff_date=str(row[COL["eff_date"]] or "").strip(),
-                trans_code=str(row[COL["trans_code"]] or "").strip(),
-                debit=_num(row[COL["debit"]]),
+                trans_date=str(get("trans_date") or "").strip(),
+                trans_ts=_parse_ts(get("trans_date")),
+                eff_date=str(get("eff_date") or "").strip(),
+                trans_code=str(get("trans_code") or "").strip(),
+                debit=_num(get("debit")),
                 credit=credit,
-                balance=_num(row[COL["balance"]]),
-                seq_no=str(row[COL["seq_no"]] or "").strip(),
-                teller_id=str(row[COL["teller_id"]] or "").strip(),
-                branch=str(row[COL["branch"]] or "").strip(),
+                balance=_num(get("balance")),
+                seq_no=str(get("seq_no") or "").strip(),
+                teller_id=str(get("teller_id") or "").strip(),
+                branch=str(get("branch") or "").strip(),
                 description=desc,
-                corr_account=str(row[COL["corr_account"]] or "").strip(),
-                corr_name=str(row[COL["corr_name"]] or "").strip(),
-                corr_bank=str(row[COL["corr_bank"]] or "").strip(),
+                corr_account=str(get("corr_account") or "").strip()
+                or (acc_m.group(1) if (acc_m := _DESC_ACCOUNT.search(desc)) else ""),
+                corr_name=str(get("corr_name") or "").strip(),
+                corr_bank=str(get("corr_bank") or "").strip(),
                 order_id=order_id,
                 ky=ky,
                 cif=cif,

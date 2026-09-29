@@ -1,0 +1,34 @@
+name: Import BIDV statements from Gmail
+
+on:
+  schedule:
+    # 01:30 UTC = 08:30 Vietnam time, after BIDV's early-morning e-mails.
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Lookback window in days"
+        required: false
+        default: "3"
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Import attachments into MotherDuck
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          STATEMENT_PASSWORD: ${{ secrets.STATEMENT_PASSWORD }}
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          MD_DATABASE: ${{ vars.MD_DATABASE || 'refund_tracker' }}
+        run: |
+          if [ -z "$MOTHERDUCK_TOKEN" ]; then echo "MOTHERDUCK_TOKEN secret is required"; exit 1; fi
+          python -m refund_tracker.gmail_import --days "${{ github.event.inputs.days || '3' }}"
