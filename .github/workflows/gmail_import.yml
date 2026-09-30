@@ -2,14 +2,24 @@ name: Import BIDV statements from Gmail
 
 on:
   schedule:
-    # 01:30 UTC = 08:30 Vietnam time, after BIDV's early-morning e-mails.
-    - cron: "30 1 * * *"
+    # GitHub may delay or silently drop scheduled runs (worst at the top and
+    # half of the hour), so run three times a day at off-peak minutes.
+    # Re-runs are cheap: already-imported attachments are skipped.
+    # 23:47 / 02:17 / 05:17 UTC = 06:47 / 09:17 / 12:17 Vietnam time.
+    - cron: "47 23 * * *"
+    - cron: "17 2 * * *"
+    - cron: "17 5 * * *"
   workflow_dispatch:
     inputs:
       days:
         description: "Lookback window in days"
         required: false
         default: "3"
+
+# Never run two imports at once (e.g. a manual run overlapping a scheduled one).
+concurrency:
+  group: gmail-import
+  cancel-in-progress: false
 
 jobs:
   import:
