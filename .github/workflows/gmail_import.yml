@@ -42,3 +42,4 @@ jobs:
         run: |
           if [ -z "$MOTHERDUCK_TOKEN" ]; then echo "MOTHERDUCK_TOKEN secret is required"; exit 1; fi
           python -m refund_tracker.gmail_import --days "${{ github.event.inputs.days || '3' }}"
+# Re-runs are cheap: already-imported attachments are skipped.
