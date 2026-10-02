@@ -14,6 +14,7 @@ import json
 import os
 import re
 import tempfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -456,38 +457,45 @@ with tab_history:
                 parts.append("-".join(_STATUS_SLUG[s] for s in picked_status))
             fname = "_".join(parts) + ".csv"
 
-            # Export ALL matching rows (not just the current page) as CSV parts
-            # of at most _EXPORT_PART rows (fits Excel's 1,048,576-row limit).
-            # Only ONE part is built at a time and DuckDB writes it straight to
-            # disk: holding millions of rows in memory crashes the app.
+            # Export ALL matching rows as CSV parts of at most _EXPORT_PART rows
+            # (fits Excel's 1,048,576-row limit). Parts are processed one at a
+            # time: load a part, write it, compress it into the zip on disk,
+            # free it, then load the next — so memory never holds more than
+            # one part. One part -> a plain .csv; several -> a .zip.
             _EXPORT_PART = 500_000
             n_parts = max(1, (total + _EXPORT_PART - 1) // _EXPORT_PART)
             stem = fname[:-4]
-            if n_parts == 1:
-                part_no = 1
-            else:
-                st.caption(f"{total:,} dòng → {n_parts} file, mỗi file tối đa "
-                           f"{_EXPORT_PART:,} dòng. Chuẩn bị và tải lần lượt từng file.")
-                part_no = st.selectbox(
-                    "File", list(range(1, n_parts + 1)), key="hist_part",
-                    format_func=lambda i: (
-                        f"Phần {i}/{n_parts} — dòng {(i - 1) * _EXPORT_PART + 1:,}"
-                        f"–{min(i * _EXPORT_PART, total):,}"))
-            part_name = (fname if n_parts == 1
-                         else f"{stem}_part{part_no:02d}of{n_parts:02d}.csv")
-            if st.button(f"Chuẩn bị {part_name}", key="hist_prep"):
-                with st.spinner("Đang xuất dữ liệu…"):
-                    with tempfile.TemporaryDirectory() as tmp:
-                        out = os.path.join(tmp, "part.csv")
-                        store.export_csv(out, limit=_EXPORT_PART,
-                                         offset=(part_no - 1) * _EXPORT_PART,
-                                         **filters)
-                        data = Path(out).read_bytes()
-                # BOM so Excel opens the Vietnamese headers as UTF-8.
-                st.session_state["hist_csv"] = (part_name, b"\xef\xbb\xbf" + data)
+            label = (f"Chuẩn bị CSV (tất cả {total:,} dòng)" if n_parts == 1 else
+                     f"Chuẩn bị CSV (tất cả {total:,} dòng → {n_parts} file × tối đa "
+                     f"{_EXPORT_PART:,} dòng, nén .zip)")
+            if st.button(label, key="hist_prep"):
+                st.session_state.pop("hist_csv", None)
+                bom = b"\xef\xbb\xbf"  # so Excel reads the Vietnamese headers as UTF-8
+                bar = st.progress(0.0, text="Đang xuất dữ liệu…")
+                with tempfile.TemporaryDirectory() as tmp:
+                    zpath = os.path.join(tmp, "export.zip")
+                    names = []
+                    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for i, (path, rows) in enumerate(
+                                store.export_parts(tmp, _EXPORT_PART, **filters), 1):
+                            name = (fname if n_parts == 1
+                                    else f"{stem}_part{i:02d}of{n_parts:02d}.csv")
+                            zf.writestr(name, bom + Path(path).read_bytes())
+                            os.remove(path)  # free the part before loading the next
+                            names.append(name)
+                            bar.progress(min(i / n_parts, 1.0),
+                                         text=f"Đã xuất {i}/{n_parts} file")
+                    if len(names) <= 1:
+                        with zipfile.ZipFile(zpath) as zf:
+                            data = zf.read(names[0]) if names else bom
+                        st.session_state["hist_csv"] = (fname, data, "text/csv")
+                    else:
+                        st.session_state["hist_csv"] = (
+                            f"{stem}.zip", Path(zpath).read_bytes(), "application/zip")
+                bar.empty()
             prep = st.session_state.get("hist_csv")
             if prep:
                 st.download_button(
                     f"⬇ Tải {prep[0]}", prep[1], file_name=prep[0],
-                    mime="text/csv", key="hist_csv_dl",
+                    mime=prep[2], key="hist_csv_dl",
                 )
