@@ -10,10 +10,12 @@ Run:  .\.venv\Scripts\streamlit.exe run Refund_Tracker\app.py
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import tempfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -456,16 +458,40 @@ with tab_history:
                 parts.append("-".join(_STATUS_SLUG[s] for s in picked_status))
             fname = "_".join(parts) + ".csv"
 
-            # Export ALL matching rows (not just the current page). Build once on
-            # demand — querying every row can be heavy for a broad search.
-            if st.button(f"Chuẩn bị CSV (tất cả {total:,} dòng)", key="hist_prep"):
-                allrows = store.transaction_lookup(**filters, limit=10_000_000,
-                                                   offset=0)
-                st.session_state["hist_csv"] = (
-                    fname, allrows.to_csv(index=False).encode("utf-8-sig"))
+            # Export ALL matching rows (not just the current page), split into
+            # CSV parts of at most _EXPORT_PART rows (fits Excel's 1,048,576-row
+            # limit). One part -> a plain .csv; several -> a .zip of parts.
+            # Fetched part by part so the whole result is never in one frame.
+            _EXPORT_PART = 500_000
+            n_parts = max(1, (total + _EXPORT_PART - 1) // _EXPORT_PART)
+            label = (f"Chuẩn bị CSV (tất cả {total:,} dòng)" if n_parts == 1 else
+                     f"Chuẩn bị CSV (tất cả {total:,} dòng → {n_parts} file "
+                     f"× tối đa {_EXPORT_PART:,} dòng, nén .zip)")
+            if st.button(label, key="hist_prep"):
+                stem = fname[:-4]
+                with st.spinner("Đang xuất dữ liệu…"):
+                    if n_parts == 1:
+                        part = store.transaction_lookup(**filters,
+                                                        limit=_EXPORT_PART, offset=0)
+                        st.session_state["hist_csv"] = (
+                            fname, part.to_csv(index=False).encode("utf-8-sig"),
+                            "text/csv")
+                    else:
+                        buf = io.BytesIO()
+                        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                            for i in range(n_parts):
+                                part = store.transaction_lookup(
+                                    **filters, limit=_EXPORT_PART,
+                                    offset=i * _EXPORT_PART)
+                                zf.writestr(
+                                    f"{stem}_part{i + 1:02d}of{n_parts:02d}.csv",
+                                    part.to_csv(index=False).encode("utf-8-sig"))
+                                del part
+                        st.session_state["hist_csv"] = (
+                            f"{stem}.zip", buf.getvalue(), "application/zip")
             prep = st.session_state.get("hist_csv")
             if prep:
                 st.download_button(
-                    "⬇ Tải CSV (tất cả)", prep[1], file_name=prep[0],
-                    mime="text/csv", key="hist_csv_dl",
+                    f"⬇ Tải {prep[0]}", prep[1], file_name=prep[0],
+                    mime=prep[2], key="hist_csv_dl",
                 )
