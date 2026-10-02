@@ -23,6 +23,7 @@ class FileResult:
     filename: str
     total_rows: int = 0
     insurance_rows: int = 0
+    flagged_rows: int = 0
     new_rows: int = 0
     new_duplicates: int = 0
     skipped_existing: int = 0
@@ -38,6 +39,7 @@ class FileResult:
             "File": self.filename,
             "Tổng dòng": self.total_rows,
             "Dòng bảo hiểm": self.insurance_rows,
+            "Dòng cảnh báo": self.flagged_rows,
             "Dòng mới": self.new_rows,
             "Trùng mới": self.new_duplicates,
             "Bỏ qua (đã có)": self.skipped_existing,
@@ -64,6 +66,7 @@ def process_one_file(store, path: str, filename: str) -> FileResult:
             filename=filename,
             total_rows=summary.get("total_numbered_rows", 0),
             insurance_rows=summary.get("insurance_rows", 0),
+            flagged_rows=summary.get("flagged_rows", 0),
             new_rows=report["new_rows"],
             new_duplicates=report["new_duplicates"],
             skipped_existing=report["skipped_existing"],
@@ -81,5 +84,6 @@ def aggregate(results) -> dict:
         "total_new_rows": sum(r.new_rows for r in results),
         "total_new_duplicates": sum(r.new_duplicates for r in results),
         "total_insurance_rows": sum(r.insurance_rows for r in results),
+        "total_flagged_rows": sum(r.flagged_rows for r in results),
         "total_skipped_existing": sum(r.skipped_existing for r in results),
     }

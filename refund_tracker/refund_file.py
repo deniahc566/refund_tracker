@@ -17,13 +17,13 @@ def build_refund_rows(pending: list) -> list[dict]:
 
     `pending` rows come from Store.pending_duplicates() with columns:
     (ref_no, dedup_key, cif, product, trans_date, corr_account, corr_name,
-     corr_bank, credit, ky, dup_of_ref)
+     corr_bank, credit, ky, dup_of_ref, flags)
     """
     out: list[dict] = []
     for (ref_no, dedup_key, cif, product, _tdate, corr_account, corr_name,
-         corr_bank, credit, ky, _dup_of) in pending:
+         corr_bank, credit, ky, _dup_of, flags) in pending:
         rule = product_rule(product)
-        needs_review = not rule
+        needs_review = not rule or bool(flags)
         bank = rule.get("beneficiary_bank") or corr_bank
         amount = rule.get("refund_amount")
         if amount is None:
@@ -47,6 +47,7 @@ def build_refund_rows(pending: list) -> list[dict]:
             "currency": currency,                  # F
             "payment_detail": payment_detail,      # G (Nội dung / Remark)
             "needs_review": needs_review,
+            "flags": flags or "",
         })
     return out
 

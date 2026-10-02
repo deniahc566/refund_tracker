@@ -125,7 +125,8 @@ def fetch_attachments(user: str, app_password: str, sender: str,
     return found
 
 
-def run(days: int | None = None, dry_run: bool = False, store=None) -> list[FileResult]:
+def run(days: int | None = None, dry_run: bool = False, store=None,
+        reimport: bool = False) -> list[FileResult]:
     user = os.environ.get("GMAIL_USER", "").strip()
     app_pw = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
     stmt_pw = os.environ.get("STATEMENT_PASSWORD", "").strip()
@@ -154,7 +155,7 @@ def run(days: int | None = None, dry_run: bool = False, store=None) -> list[File
                 "SELECT 1 FROM gmail_imports WHERE message_id=? AND attachment=? "
                 "AND status='ok'", [a.message_id, a.filename],
             ).fetchone()
-            if done:
+            if done and not reimport:
                 print(f"  skip (already imported): {a.filename}")
                 continue
             try:
@@ -171,7 +172,8 @@ def run(days: int | None = None, dry_run: bool = False, store=None) -> list[File
                  "ok" if res.ok else "error", res.error, _dt.datetime.now()],
             )
             print(f"  {'OK ' if res.ok else 'ERR'} {a.filename}: new_rows={res.new_rows} "
-                  f"new_dups={res.new_duplicates} skipped={res.skipped_existing} {res.error}")
+                  f"new_dups={res.new_duplicates} skipped={res.skipped_existing} "
+                  f"flagged={res.flagged_rows} {res.error}")
 
     print("Summary:", aggregate(results))
     return results
@@ -181,8 +183,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--days", type=int, default=None, help="lookback window in days")
     ap.add_argument("--dry-run", action="store_true", help="list attachments only")
+    ap.add_argument("--reimport", action="store_true",
+                    help="re-read already-imported attachments (e.g. after a parser fix); "
+                         "rows already in the ledger are still skipped by ref_no")
     args = ap.parse_args(argv)
-    results = run(days=args.days, dry_run=args.dry_run)
+    results = run(days=args.days, dry_run=args.dry_run, reimport=args.reimport)
     return 1 if any(not r.ok for r in results) else 0
 
 

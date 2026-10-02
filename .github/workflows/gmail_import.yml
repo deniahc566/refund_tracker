@@ -15,6 +15,10 @@ on:
         description: "Lookback window in days"
         required: false
         default: "3"
+      reimport:
+        description: "Re-read already-imported attachments (after a parser fix)"
+        type: boolean
+        default: false
 
 # Never run two imports at once (e.g. a manual run overlapping a scheduled one).
 concurrency:
@@ -41,5 +45,6 @@ jobs:
           MD_DATABASE: ${{ vars.MD_DATABASE || 'LiteX_PO_Data' }}
         run: |
           if [ -z "$MOTHERDUCK_TOKEN" ]; then echo "MOTHERDUCK_TOKEN secret is required"; exit 1; fi
-          python -m refund_tracker.gmail_import --days "${{ github.event.inputs.days || '3' }}"
+          python -m refund_tracker.gmail_import --days "${{ github.event.inputs.days || '3' }}" \
+            ${{ github.event.inputs.reimport == 'true' && '--reimport' || '' }}
 # Re-runs are cheap: already-imported attachments are skipped.

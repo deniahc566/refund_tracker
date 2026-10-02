@@ -197,19 +197,19 @@ with tab_queue:
         df = pd.DataFrame(refund_rows)
         view = df[["ref_no", "cif", "product", "beneficiary_account",
                    "beneficiary_name", "beneficiary_bank", "amount", "currency",
-                   "payment_detail", "needs_review"]].rename(columns={
+                   "payment_detail", "needs_review", "flags"]].rename(columns={
             "ref_no": "Mã tham chiếu", "cif": "CIF", "product": "Sản phẩm",
             "beneficiary_account": "TK hưởng", "beneficiary_name": "Tên hưởng",
             "beneficiary_bank": "Ngân hàng", "amount": "Số tiền",
             "currency": "Loại tiền", "payment_detail": "Nội dung",
-            "needs_review": "Cần kiểm tra",
+            "needs_review": "Cần kiểm tra", "flags": "Cảnh báo",
         })
         st.dataframe(view, use_container_width=True)
         if df["needs_review"].any():
             st.warning(
-                "Một số dòng thuộc sản phẩm chưa cấu hình ngân hàng/số tiền "
-                "(Cần kiểm tra = True) — đang lấy tạm giá trị từ sao kê. Hãy "
-                "kiểm tra trước khi gửi."
+                "Một số dòng cần kiểm tra (Cần kiểm tra = True): sản phẩm chưa "
+                "cấu hình ngân hàng/số tiền, hoặc dữ liệu thiếu/bất thường — xem "
+                "cột Cảnh báo. Hãy kiểm tra trước khi gửi."
             )
 
         # Always-available download: the file is rebuilt from the current queue

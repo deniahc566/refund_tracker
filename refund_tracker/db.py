@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     is_duplicate  BOOLEAN DEFAULT FALSE,
     dup_of_ref    VARCHAR,
     source_file   VARCHAR,
-    ingested_at   TIMESTAMP
+    ingested_at   TIMESTAMP,
+    flags         VARCHAR     -- "; "-joined data warnings, NULL/'' = clean
 );
 
 CREATE TABLE IF NOT EXISTS refunds (
@@ -105,6 +106,9 @@ class Store:
         self.con.execute(
             "ALTER TABLE refunds ADD COLUMN IF NOT EXISTS bank_txn_code VARCHAR"
         )
+        self.con.execute(
+            "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS flags VARCHAR"
+        )
 
     def close(self):
         self.con.close()
@@ -121,7 +125,7 @@ class Store:
             "ref_no", "stt", "trans_date", "trans_ts", "eff_date", "trans_code",
             "debit", "credit", "balance", "seq_no", "teller_id", "branch",
             "description", "corr_account", "corr_name", "corr_bank", "order_id",
-            "ky", "cif", "product", "dedup_key",
+            "ky", "cif", "product", "dedup_key", "flags",
         ]
         before = self.con.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
         if rows:
@@ -175,12 +179,13 @@ class Store:
         it, the entire table is recomputed.
         """
         if ingested_at is None:
-            scope = "SELECT ref_no, dedup_key, trans_ts, seq_no FROM transactions"
+            scope = ("SELECT ref_no, dedup_key, trans_ts, seq_no FROM transactions "
+                     "WHERE dedup_key IS NOT NULL")
             params: list = []
         else:
             scope = (
                 "SELECT ref_no, dedup_key, trans_ts, seq_no FROM transactions "
-                "WHERE dedup_key IN ("
+                "WHERE dedup_key IS NOT NULL AND dedup_key IN ("
                 "  SELECT DISTINCT dedup_key FROM transactions WHERE ingested_at = ?"
                 ")"
             )
@@ -222,7 +227,7 @@ class Store:
             """
             SELECT t.ref_no, t.dedup_key, t.cif, t.product, t.trans_date,
                    t.corr_account, t.corr_name, t.corr_bank, t.credit, t.ky,
-                   t.dup_of_ref
+                   t.dup_of_ref, t.flags
             FROM transactions t
             LEFT JOIN refunds r ON r.ref_no = t.ref_no
             WHERE t.is_duplicate
@@ -451,7 +456,8 @@ class Store:
                 r.bank_txn_code                  AS "FT GD hoàn",
                 t.dup_of_ref                     AS "Mã tham chiếu gốc",
                 o.trans_date                     AS "Ngày thu phí gốc",
-                r.reason                         AS "Lý do"
+                r.reason                         AS "Lý do",
+                t.flags                          AS "Cảnh báo"
             FROM transactions t
             LEFT JOIN refunds r ON r.ref_no = t.ref_no
             LEFT JOIN transactions o ON o.ref_no = t.dup_of_ref
