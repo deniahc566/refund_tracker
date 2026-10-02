@@ -374,7 +374,7 @@ class Store:
     # -- transaction lookup -------------------------------------------------
     @staticmethod
     def _lookup_where(ref_no, order_id, account, charge_from, charge_to,
-                      refund_from, refund_to, kinds, statuses):
+                      refund_from, refund_to, kinds, statuses, flags=None):
         """Build the shared WHERE clause + params for the lookup/count queries."""
         # Effective refund status: originals -> 'none'; duplicates -> refund
         # status, defaulting to 'pending' when no refund row exists yet.
@@ -406,16 +406,24 @@ class Store:
         if statuses:
             where.append(eff_status + " IN (" + ",".join(["?"] * len(statuses)) + ")")
             params.extend(statuses)
+        if flags:
+            # flags=True -> any warning; a list -> rows with any of these warnings.
+            if flags is True:
+                where.append("COALESCE(t.flags, '') <> ''")
+            else:
+                where.append("(" + " OR ".join(["t.flags ILIKE ?"] * len(flags)) + ")")
+                params.extend(f"%{f}%" for f in flags)
         return " AND ".join(where), params
 
     @_synchronized
     def transaction_lookup_count(self, ref_no=None, order_id=None, account=None,
                                  charge_from=None, charge_to=None, refund_from=None,
-                                 refund_to=None, kinds=None, statuses=None) -> int:
+                                 refund_to=None, kinds=None, statuses=None,
+                                 flags=None) -> int:
         """Total rows matching the lookup filters (for pagination)."""
         where, params = self._lookup_where(ref_no, order_id, account, charge_from,
                                             charge_to, refund_from, refund_to,
-                                            kinds, statuses)
+                                            kinds, statuses, flags)
         return self.con.execute(
             f"SELECT COUNT(*) FROM transactions t "
             f"LEFT JOIN refunds r ON r.ref_no = t.ref_no WHERE {where}", params
@@ -425,7 +433,7 @@ class Store:
     def transaction_lookup(self, ref_no=None, order_id=None, account=None,
                            charge_from=None, charge_to=None, refund_from=None,
                            refund_to=None, kinds=None, statuses=None,
-                           limit=1000, offset=0):
+                           flags=None, limit=1000, offset=0):
         """Transaction-centric lookup (paginated via limit/offset). Returns every
         insurance charge — the legitimate first charge ("Gốc") and each later
         duplicate ("Trùng") — with its details and refund state, as a pandas
@@ -433,7 +441,7 @@ class Store:
         """
         where, params = self._lookup_where(ref_no, order_id, account, charge_from,
                                             charge_to, refund_from, refund_to,
-                                            kinds, statuses)
+                                            kinds, statuses, flags)
         sql = f"""
             SELECT
                 t.ref_no                         AS "Mã tham chiếu",

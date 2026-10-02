@@ -344,6 +344,14 @@ def _style_lookup(df: pd.DataFrame):
     return sty
 
 
+# Warning types written by parser.parse_statement into transactions.flags.
+_FLAG_TYPES = [
+    "CIF = null", "Thiếu CIF", "Thiếu mã đơn", "Thiếu số tham chiếu",
+    "Trùng số tham chiếu trong file", "Diễn giải không đúng định dạng",
+    "Ngày giao dịch sai định dạng", "Thiếu STK hưởng",
+    "Sản phẩm chưa cấu hình", "Số tiền bất thường",
+]
+
 with tab_history:
     st.subheader("Tra cứu giao dịch")
     r1a, r1b, r1c = st.columns(3)
@@ -360,6 +368,10 @@ with tab_history:
                                  key="h_kind")
     picked_status = c6.multiselect("Trạng thái hoàn", list(_STATUS_LABELS.keys()),
                                    key="h_status")
+    c7, c8 = st.columns([1, 3])
+    only_flagged = c7.checkbox("Chỉ dòng có cảnh báo", key="h_flagged")
+    picked_flags = c8.multiselect("Loại cảnh báo", _FLAG_TYPES, key="h_flags",
+                                  help="Để trống = mọi loại cảnh báo")
 
     def _range(v):
         """A st.date_input range -> (from, to); tolerant of 0/1/2 picks."""
@@ -384,6 +396,7 @@ with tab_history:
             refund_from=rf, refund_to=rt,
             kinds=[_KIND_LABELS[k] for k in picked_kind] or None,
             statuses=[_STATUS_LABELS[s] for s in picked_status] or None,
+            flags=picked_flags or (True if only_flagged else None),
         )
         st.session_state["hist_page"] = 1
         st.session_state.pop("hist_csv", None)  # invalidate prepared export
