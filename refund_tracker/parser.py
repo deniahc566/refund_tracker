@@ -122,6 +122,8 @@ _HEADER_KEYS = {
     "corr_bank": ("ngân hàng đối ứng",),
     "ref_no": ("số tham chiếu", "reference number"),
 }
+# Marks a premium line at all; lines without it (other transfers) are skipped.
+_IS_INSURANCE = re.compile(r"Phi\s+Bao\s+hiem", re.IGNORECASE)
 # Counterparty account embedded in the description: "REM Tfr Ac:4270804530 ..."
 _DESC_ACCOUNT = re.compile(r"Tfr Ac:\s*(\d+)", re.IGNORECASE)
 
@@ -150,7 +152,8 @@ def _detect_columns(raw_rows) -> dict:
 def parse_statement(path: str) -> tuple[list[Txn], dict]:
     """Return (insurance_transactions, summary).
 
-    Every numbered credit (> 0) row is returned as a Txn. Rows with missing,
+    Every numbered credit (> 0) row whose description mentions "Phi Bao hiem"
+    is returned as a Txn; other credits are skipped and counted. Rows with missing,
     abnormal or malformed data are kept and described in ``Txn.flags``; rows
     without a complete dedup key get ``dedup_key=None`` and are never ranked
     as duplicates.
@@ -184,12 +187,15 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
         if credit <= 0:
             continue  # debits / zero lines are not premium charges
 
-        # Every credit line is imported; anything missing, abnormal or not in
+        if not _IS_INSURANCE.search(desc):
+            unmatched.append(desc[:80])
+            continue  # not an insurance premium line
+
+        # Every premium line is imported; anything missing, abnormal or not in
         # the expected format is recorded in `flags` instead of dropping it.
         flags: list[str] = []
         m = _DETAIL.search(desc)
         if m is None:
-            unmatched.append(desc[:80])
             flags.append("Diễn giải không đúng định dạng")
             product = ky = cif = ""
         else:
