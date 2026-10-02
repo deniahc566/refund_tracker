@@ -429,16 +429,10 @@ class Store:
             f"LEFT JOIN refunds r ON r.ref_no = t.ref_no WHERE {where}", params
         ).fetchone()[0]
 
-    @_synchronized
-    def transaction_lookup(self, ref_no=None, order_id=None, account=None,
-                           charge_from=None, charge_to=None, refund_from=None,
-                           refund_to=None, kinds=None, statuses=None,
-                           flags=None, limit=1000, offset=0):
-        """Transaction-centric lookup (paginated via limit/offset). Returns every
-        insurance charge — the legitimate first charge ("Gốc") and each later
-        duplicate ("Trùng") — with its details and refund state, as a pandas
-        DataFrame with Vietnamese column headers.
-        """
+    def _lookup_sql(self, ref_no=None, order_id=None, account=None,
+                    charge_from=None, charge_to=None, refund_from=None,
+                    refund_to=None, kinds=None, statuses=None, flags=None):
+        """SQL (with LIMIT ? OFFSET ? placeholders) + params for the lookup."""
         where, params = self._lookup_where(ref_no, order_id, account, charge_from,
                                             charge_to, refund_from, refund_to,
                                             kinds, statuses, flags)
@@ -473,7 +467,24 @@ class Store:
             ORDER BY t.trans_ts DESC NULLS LAST, t.ref_no
             LIMIT ? OFFSET ?
         """
+        return sql, params
+
+    @_synchronized
+    def transaction_lookup(self, limit=1000, offset=0, **filters):
+        """Transaction-centric lookup (paginated via limit/offset). Returns every
+        insurance charge — the legitimate first charge ("Gốc") and each later
+        duplicate ("Trùng") — with its details and refund state, as a pandas
+        DataFrame with Vietnamese column headers.
+        """
+        sql, params = self._lookup_sql(**filters)
         return self.con.execute(sql, params + [int(limit), int(offset)]).df()
+
+    @_synchronized
+    def export_csv(self, path: str, limit: int, offset: int = 0, **filters) -> None:
+        """Write one slice of the lookup straight to a CSV file. DuckDB streams
+        it to disk, so a large export never sits in a pandas DataFrame."""
+        sql, params = self._lookup_sql(**filters)
+        self.con.sql(sql, params=params + [int(limit), int(offset)]).write_csv(path)
 
     # -- single-case manual entry -------------------------------------------
     @_synchronized
