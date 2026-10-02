@@ -55,7 +55,9 @@ class Txn:
     ky: str
     cif: str
     product: str
-    dedup_key: str
+    dedup_key: str | None
+    # "; "-joined warnings (missing / abnormal / malformed data). Empty = clean.
+    flags: str = ""
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -148,8 +150,10 @@ def _detect_columns(raw_rows) -> dict:
 def parse_statement(path: str) -> tuple[list[Txn], dict]:
     """Return (insurance_transactions, summary).
 
-    Only rows that are (a) numbered transactions, (b) credit > 0, and
-    (c) match the insurance description pattern are returned as Txn records.
+    Every numbered credit (> 0) row is returned as a Txn. Rows with missing,
+    abnormal or malformed data are kept and described in ``Txn.flags``; rows
+    without a complete dedup key get ``dedup_key=None`` and are never ranked
+    as duplicates.
     `summary` reports counts for the upload screen.
     """
     # Read with python-calamine (Rust) — ~10x faster than openpyxl. It returns
@@ -177,50 +181,85 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
 
         desc = str(get("description") or "")
         credit = _num(get("credit"))
-        m = _DETAIL.search(desc)
-        if m is None or credit <= 0:
-            if credit > 0:
-                unmatched.append(desc[:80])
-            continue
+        if credit <= 0:
+            continue  # debits / zero lines are not premium charges
 
+        # Every credit line is imported; anything missing, abnormal or not in
+        # the expected format is recorded in `flags` instead of dropping it.
+        flags: list[str] = []
+        m = _DETAIL.search(desc)
+        if m is None:
+            unmatched.append(desc[:80])
+            flags.append("Diễn giải không đúng định dạng")
+            product = ky = cif = ""
+        else:
+            product = m.group("product").strip()
+            ky = m.group("ky").strip()
+            cif = m.group("cif").strip()
         oid_m = _ORDER_ID.search(desc)
         order_id = oid_m.group(1) if oid_m else ""
-        product = m.group("product").strip()
-        ky = m.group("ky").strip()
-        cif = m.group("cif").strip()
-        if not cif.isdigit():
-            acc = _DESC_ACCOUNT.search(desc)
-            cif = acc.group(1) if acc else ""
+        if m is not None and not order_id:
+            flags.append("Thiếu mã đơn")
+        acc_m = _DESC_ACCOUNT.search(desc)
+        if m is not None and not cif.isdigit():
+            flags.append("CIF = null (lấy STK Tfr Ac)" if cif.lower() == "null" else "Thiếu CIF")
+            cif = acc_m.group(1) if acc_m else ""
+
+        trans_ts = _parse_ts(get("trans_date"))
+        if not re.match(r"\d{4}-\d{2}-\d{2}T", trans_ts):
+            flags.append("Ngày giao dịch sai định dạng")
+
         ref_no = str(get("ref_no") or "").strip()
-        if not ref_no or ref_no in seen_refs:
-            # Missing/duplicate reference within one file — skip to keep PK sane.
-            continue
+        seq_no = str(get("seq_no") or "").strip()
+        if not ref_no:
+            flags.append("Thiếu số tham chiếu")
+            ref_no = f"NOREF-{seq_no or s}-{trans_ts}"
+        if ref_no in seen_refs:
+            flags.append("Trùng số tham chiếu trong file")
+            n = 2
+            while f"{ref_no}#{n}" in seen_refs:
+                n += 1
+            ref_no = f"{ref_no}#{n}"
         seen_refs.add(ref_no)
+
+        corr_account = str(get("corr_account") or "").strip() or (acc_m.group(1) if acc_m else "")
+        if not corr_account:
+            flags.append("Thiếu STK hưởng")
+        if m is not None:
+            rule = config.product_rule(product)
+            if not rule:
+                flags.append("Sản phẩm chưa cấu hình")
+            elif rule.get("refund_amount") and credit != rule["refund_amount"]:
+                flags.append(f"Số tiền bất thường ({credit:,.0f})")
+
+        # Rows without a complete key never take part in duplicate detection.
+        dedup_key = (make_dedup_key(order_id, ky, cif, product)
+                     if order_id and ky and cif and product else None)
 
         txns.append(
             Txn(
                 ref_no=ref_no,
                 stt=s,
                 trans_date=str(get("trans_date") or "").strip(),
-                trans_ts=_parse_ts(get("trans_date")),
+                trans_ts=trans_ts,
                 eff_date=str(get("eff_date") or "").strip(),
                 trans_code=str(get("trans_code") or "").strip(),
                 debit=_num(get("debit")),
                 credit=credit,
                 balance=_num(get("balance")),
-                seq_no=str(get("seq_no") or "").strip(),
+                seq_no=seq_no,
                 teller_id=str(get("teller_id") or "").strip(),
                 branch=str(get("branch") or "").strip(),
                 description=desc,
-                corr_account=str(get("corr_account") or "").strip()
-                or (acc_m.group(1) if (acc_m := _DESC_ACCOUNT.search(desc)) else ""),
+                corr_account=corr_account,
                 corr_name=str(get("corr_name") or "").strip(),
                 corr_bank=str(get("corr_bank") or "").strip(),
                 order_id=order_id,
                 ky=ky,
                 cif=cif,
                 product=product,
-                dedup_key=make_dedup_key(order_id, ky, cif, product),
+                dedup_key=dedup_key,
+                flags="; ".join(flags),
             )
         )
 
@@ -228,6 +267,7 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
         "total_numbered_rows": total_rows,
         "insurance_rows": len(txns),
         "non_insurance_credit_rows": len(unmatched),
+        "flagged_rows": sum(1 for t in txns if t.flags),
         "unmatched_samples": unmatched[:10],
     }
     return txns, summary

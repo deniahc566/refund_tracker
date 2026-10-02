@@ -172,7 +172,8 @@ def run(days: int | None = None, dry_run: bool = False, store=None,
                  "ok" if res.ok else "error", res.error, _dt.datetime.now()],
             )
             print(f"  {'OK ' if res.ok else 'ERR'} {a.filename}: new_rows={res.new_rows} "
-                  f"new_dups={res.new_duplicates} skipped={res.skipped_existing} {res.error}")
+                  f"new_dups={res.new_duplicates} skipped={res.skipped_existing} "
+                  f"flagged={res.flagged_rows} {res.error}")
 
     print("Summary:", aggregate(results))
     return results
