@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import functools
+import os
 import threading
 from typing import Iterable
 
@@ -92,6 +93,10 @@ CREATE TABLE IF NOT EXISTS uploads (
     uploaded_at   TIMESTAMP
 );
 """
+
+
+# DuckDB memory cap applied only while exporting the lookup (see export_parts).
+EXPORT_MEMORY_LIMIT = os.environ.get("EXPORT_MEMORY_LIMIT", "300MB")
 
 
 class Store:
@@ -373,8 +378,9 @@ class Store:
 
     # -- transaction lookup -------------------------------------------------
     @staticmethod
-    def _lookup_where(ref_no, order_id, account, charge_from, charge_to,
-                      refund_from, refund_to, kinds, statuses, flags=None):
+    def _lookup_where(ref_no=None, order_id=None, account=None, charge_from=None,
+                      charge_to=None, refund_from=None, refund_to=None,
+                      kinds=None, statuses=None, flags=None):
         """Build the shared WHERE clause + params for the lookup/count queries."""
         # Effective refund status: originals -> 'none'; duplicates -> refund
         # status, defaulting to 'pending' when no refund row exists yet.
@@ -429,21 +435,9 @@ class Store:
             f"LEFT JOIN refunds r ON r.ref_no = t.ref_no WHERE {where}", params
         ).fetchone()[0]
 
-    @_synchronized
-    def transaction_lookup(self, ref_no=None, order_id=None, account=None,
-                           charge_from=None, charge_to=None, refund_from=None,
-                           refund_to=None, kinds=None, statuses=None,
-                           flags=None, limit=1000, offset=0):
-        """Transaction-centric lookup (paginated via limit/offset). Returns every
-        insurance charge — the legitimate first charge ("Gốc") and each later
-        duplicate ("Trùng") — with its details and refund state, as a pandas
-        DataFrame with Vietnamese column headers.
-        """
-        where, params = self._lookup_where(ref_no, order_id, account, charge_from,
-                                            charge_to, refund_from, refund_to,
-                                            kinds, statuses, flags)
-        sql = f"""
-            SELECT
+    # Display columns of the transaction lookup (t = transaction, r = refund,
+    # o = the original charge a duplicate repeats).
+    _LOOKUP_COLUMNS = """
                 t.ref_no                         AS "Mã tham chiếu",
                 CASE WHEN t.is_duplicate THEN 'Trùng' ELSE 'Gốc' END AS "Phân loại",
                 t.order_id                       AS "OrderID",
@@ -466,14 +460,106 @@ class Store:
                 o.trans_date                     AS "Ngày thu phí gốc",
                 r.reason                         AS "Lý do",
                 t.flags                          AS "Cảnh báo"
+    """
+    # Only originals of duplicates are joined, so the join never hashes the
+    # whole ledger.
+    _ORIGINALS_JOIN = """
+            LEFT JOIN (
+                SELECT ref_no, trans_date FROM transactions
+                WHERE ref_no IN (SELECT dup_of_ref FROM transactions
+                                 WHERE is_duplicate)
+            ) o ON o.ref_no = t.dup_of_ref
+    """
+
+    def _lookup_sql(self, **filters):
+        """SQL (ending in ``LIMIT ? OFFSET ?``) + params for one screen page."""
+        where, params = self._lookup_where(**filters)
+        sql = f"""
+            SELECT {self._LOOKUP_COLUMNS}
             FROM transactions t
             LEFT JOIN refunds r ON r.ref_no = t.ref_no
-            LEFT JOIN transactions o ON o.ref_no = t.dup_of_ref
+            {self._ORIGINALS_JOIN}
             WHERE {where}
             ORDER BY t.trans_ts DESC NULLS LAST, t.ref_no
             LIMIT ? OFFSET ?
         """
+        return sql, params
+
+    @_synchronized
+    def transaction_lookup(self, limit=1000, offset=0, **filters):
+        """Transaction-centric lookup (paginated via limit/offset). Returns every
+        insurance charge — the legitimate first charge ("Gốc") and each later
+        duplicate ("Trùng") — with its details and refund state, as a pandas
+        DataFrame with Vietnamese column headers.
+        """
+        sql, params = self._lookup_sql(**filters)
         return self.con.execute(sql, params + [int(limit), int(offset)]).df()
+
+    def export_parts(self, out_dir: str, part_size: int, **filters):
+        """Export the whole lookup result as CSV files of at most ``part_size``
+        rows, one part at a time: load a part, write it to disk, release it,
+        then load the next. Yields ``(path, rows)`` for each part.
+
+        Each part is built in two steps so memory stays bounded by one part:
+        1. pick the part's keys — a top-N over two narrow columns, continuing
+           after the previous part's last key (keyset pagination, no OFFSET);
+        2. join the full display columns for just those keys and write them
+           (an ordinary sort, which DuckDB can spill to disk).
+        """
+        where, params = self._lookup_where(**filters)
+        keys_sql = f"""
+            SELECT COALESCE(t.trans_ts, '') AS k_ts, t.ref_no AS k_ref
+            FROM transactions t
+            LEFT JOIN refunds r ON r.ref_no = t.ref_no
+            WHERE {where}
+              AND (COALESCE(t.trans_ts, '') > ? OR
+                   (COALESCE(t.trans_ts, '') = ? AND t.ref_no > ?))
+            ORDER BY k_ts, k_ref
+            LIMIT ?
+        """
+        part_sql = f"""
+            SELECT {self._LOOKUP_COLUMNS}
+            FROM _export_keys k
+            JOIN transactions t ON t.ref_no = k.k_ref
+            LEFT JOIN refunds r ON r.ref_no = t.ref_no
+            {self._ORIGINALS_JOIN}
+            ORDER BY k.k_ts, k.k_ref
+        """
+        with self._lock:
+            # Cap DuckDB's working memory while exporting and let it spill to
+            # disk; Streamlit Cloud gives the whole app only ~1 GB.
+            prev_limit = self.con.execute(
+                "SELECT current_setting('memory_limit')").fetchone()[0]
+            self.con.execute(f"SET memory_limit='{EXPORT_MEMORY_LIMIT}'")
+            self.con.execute(f"SET temp_directory='{os.path.join(out_dir, 'spill')}'")
+        try:
+            yield from self._export_parts(out_dir, part_size, keys_sql, part_sql, params)
+        finally:
+            with self._lock:
+                self.con.execute(f"SET memory_limit='{prev_limit}'")
+
+    def _export_parts(self, out_dir, part_size, keys_sql, part_sql, params):
+        after = ("", "")
+        i = 0
+        while True:
+            with self._lock:
+                self.con.execute(
+                    "CREATE OR REPLACE TEMP TABLE _export_keys AS " + keys_sql,
+                    params + [after[0], after[0], after[1], int(part_size)])
+                rows, last_ts, last_ref = self.con.execute(
+                    "SELECT count(*), max(k_ts), arg_max(k_ref, (k_ts, k_ref)) "
+                    "FROM _export_keys").fetchone()
+                if rows:
+                    i += 1
+                    path = os.path.join(out_dir, f"part{i:03d}.csv")
+                    self.con.sql(part_sql).write_csv(path)
+                    after = (last_ts, last_ref)
+                self.con.execute("DROP TABLE IF EXISTS _export_keys")
+            if not rows:
+                return
+            yield path, rows
+            if rows < part_size:
+                return
 
     # -- single-case manual entry -------------------------------------------
     @_synchronized

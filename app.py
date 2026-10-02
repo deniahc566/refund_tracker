@@ -14,6 +14,7 @@ import json
 import os
 import re
 import tempfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -456,16 +457,45 @@ with tab_history:
                 parts.append("-".join(_STATUS_SLUG[s] for s in picked_status))
             fname = "_".join(parts) + ".csv"
 
-            # Export ALL matching rows (not just the current page). Build once on
-            # demand — querying every row can be heavy for a broad search.
-            if st.button(f"Chuẩn bị CSV (tất cả {total:,} dòng)", key="hist_prep"):
-                allrows = store.transaction_lookup(**filters, limit=10_000_000,
-                                                   offset=0)
-                st.session_state["hist_csv"] = (
-                    fname, allrows.to_csv(index=False).encode("utf-8-sig"))
+            # Export ALL matching rows as CSV parts of at most _EXPORT_PART rows
+            # (fits Excel's 1,048,576-row limit). Parts are processed one at a
+            # time: load a part, write it, compress it into the zip on disk,
+            # free it, then load the next — so memory never holds more than
+            # one part. One part -> a plain .csv; several -> a .zip.
+            _EXPORT_PART = 500_000
+            n_parts = max(1, (total + _EXPORT_PART - 1) // _EXPORT_PART)
+            stem = fname[:-4]
+            label = (f"Chuẩn bị CSV (tất cả {total:,} dòng)" if n_parts == 1 else
+                     f"Chuẩn bị CSV (tất cả {total:,} dòng → {n_parts} file × tối đa "
+                     f"{_EXPORT_PART:,} dòng, nén .zip)")
+            if st.button(label, key="hist_prep"):
+                st.session_state.pop("hist_csv", None)
+                bom = b"\xef\xbb\xbf"  # so Excel reads the Vietnamese headers as UTF-8
+                bar = st.progress(0.0, text="Đang xuất dữ liệu…")
+                with tempfile.TemporaryDirectory() as tmp:
+                    zpath = os.path.join(tmp, "export.zip")
+                    names = []
+                    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for i, (path, rows) in enumerate(
+                                store.export_parts(tmp, _EXPORT_PART, **filters), 1):
+                            name = (fname if n_parts == 1
+                                    else f"{stem}_part{i:02d}of{n_parts:02d}.csv")
+                            zf.writestr(name, bom + Path(path).read_bytes())
+                            os.remove(path)  # free the part before loading the next
+                            names.append(name)
+                            bar.progress(min(i / n_parts, 1.0),
+                                         text=f"Đã xuất {i}/{n_parts} file")
+                    if len(names) <= 1:
+                        with zipfile.ZipFile(zpath) as zf:
+                            data = zf.read(names[0]) if names else bom
+                        st.session_state["hist_csv"] = (fname, data, "text/csv")
+                    else:
+                        st.session_state["hist_csv"] = (
+                            f"{stem}.zip", Path(zpath).read_bytes(), "application/zip")
+                bar.empty()
             prep = st.session_state.get("hist_csv")
             if prep:
                 st.download_button(
-                    "⬇ Tải CSV (tất cả)", prep[1], file_name=prep[0],
-                    mime="text/csv", key="hist_csv_dl",
+                    f"⬇ Tải {prep[0]}", prep[1], file_name=prep[0],
+                    mime=prep[2], key="hist_csv_dl",
                 )
