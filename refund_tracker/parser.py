@@ -25,9 +25,10 @@ from .config import COL, norm
 
 # order_id: the long numeric token immediately before "_Phi"
 _ORDER_ID = re.compile(r"_(\d{12,25})_Phi", re.IGNORECASE)
-# product / ky / cif in one shot
+# product / ky / cif in one shot. BIDV sometimes writes "cua ma KH null"; those
+# rows are still real charges, so the CIF falls back to the "Tfr Ac:" account.
 _DETAIL = re.compile(
-    r"Phi Bao hiem\s+(?P<product>.+?)\s+Ky\s+(?P<ky>\S+)\s+cua ma KH\s+(?P<cif>\d+)",
+    r"Phi Bao hiem\s+(?P<product>.+?)\s+Ky\s+(?P<ky>\S+)\s+cua ma KH\s+(?P<cif>\d+|null)\b",
     re.IGNORECASE,
 )
 
@@ -187,6 +188,9 @@ def parse_statement(path: str) -> tuple[list[Txn], dict]:
         product = m.group("product").strip()
         ky = m.group("ky").strip()
         cif = m.group("cif").strip()
+        if not cif.isdigit():
+            acc = _DESC_ACCOUNT.search(desc)
+            cif = acc.group(1) if acc else ""
         ref_no = str(get("ref_no") or "").strip()
         if not ref_no or ref_no in seen_refs:
             # Missing/duplicate reference within one file — skip to keep PK sane.
